@@ -1,0 +1,276 @@
+# dsf design
+
+> **Status:** agreed design, pre-implementation (October 2026). Anything marked *open* is answered by a spike (see [Open questions](#open-questions-spikes)) before the code that depends on it is written. When reality disagrees with this document, change the document in the same PR.
+
+## 1. Purpose
+
+dsf turns GitHub issues that a trusted human has approved into verified **draft** pull requests, unattended, inside a time window (by default overnight). It replaces a prototype made of a Python orchestrator, a bash worker entrypoint and a digest script. The prototype proved the idea, but it left the GitHub token inside the agent's container, retried from scratch after any interruption, and had no way to stage or gate the work.
+
+dsf is deliberately small and single-user. The reference design is [Fabro](https://github.com/fabro-sh/fabro). dsf takes its patterns, not its code (§9).
+
+## 2. Fixed decisions
+
+| Decision | Detail |
+|---|---|
+| Output | **Draft PRs only.** Never merges; branch protection on target repos decides what lands. |
+| Trigger | Issues labelled `factory:ready` in configured repos. Lifecycle: `factory:draft` → `factory:ready` (human) → `factory:running` → `factory:review` (draft PR open) or `factory:blocked` (reason in a comment). `blocked by #N` in the body makes an issue wait for #N to close. |
+| Agent | Claude Code headless (`claude -p`), authenticated with `CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token` (subscription usage, not API keys). |
+| Isolation | Every stage runs in a hardened, throwaway Docker container on a dedicated host. |
+| Credentials | **The agent never holds a GitHub credential.** The host clones, commits and pushes. |
+| Done | The target repo's `.factory/verify.sh` exits 0. Failures feed a bounded fix loop. |
+| Limits | A usage-limit hit requeues the issue and pauses claiming until the limit resets. |
+| Schedule | Claims only inside a configurable window (default 23:00–07:00 local); running work finishes. One worker by default, maximum two. |
+| Reporting | A morning digest (default 07:00) to a Microsoft Teams Workflows webhook, or to stdout. |
+| v1 scope | Staged pipeline, per-repo workflows, optional plan-approval gate, read-only web runs board. |
+
+## 3. Architecture
+
+One binary, `dsf`. In production it runs as `dsf serve`, a systemd service owned by an unprivileged `factory` user in the `docker` group. Membership of that group is root-equivalent on the host, so the host should be a dedicated VM; that VM boundary is what contains it. `dsf serve` runs:
+
+- **Scheduler.** Polls GitHub on an interval, applies the window, worker limit and backoff, and claims issues.
+- **Run tasks.** One tokio task per active run, executing its workflow stage by stage.
+- **Egress proxy.** The agent containers' only route to the internet (§6).
+- **Board.** Read-only HTML on `127.0.0.1`, exposed by the operator if wanted (e.g. `tailscale serve`).
+- **Digest.** The morning summary.
+
+CLI commands for operators and development:
+
+| Command | Purpose |
+|---|---|
+| `dsf run owner/repo#N` | Run one issue in the foreground |
+| `dsf run --local <repo> --issue-file <file>` | Run against a local repo with no GitHub, for development and tests |
+| `dsf doctor` | Preflight: Docker, tokens, image, config, labels |
+| `dsf workflow validate <file>` | Validate a workflow file |
+| `dsf labels init` | Create the label set in configured repos |
+| `dsf digest --dry-run` | Render the digest without sending it |
+
+## 4. Pipeline and per-repo workflows
+
+A workflow is a small graph of **stages**. Each stage has a kind and routes on its **outcome label**:
+
+| Kind | Does | Outcome labels |
+|---|---|---|
+| `agent` | Runs Claude Code. `mode = "read"` uses `--restricted --tools Read,Grep,Glob` over a read-only worktree; `mode = "write"` allows edits. A `schema` makes Claude return structured output via `--json-schema`, whose `outcome` field becomes the label. | `success` / `failure`, or the schema's labels |
+| `command` | Runs a command, e.g. `.factory/verify.sh`, in a container with no credentials | `success` / `failure` |
+| `gate` | Waits for a human decision on the issue (§5) | `approved` / `rejected` |
+
+The terminals `@publish` and `@blocked` end the run.
+
+The built-in default workflow:
+
+```toml
+version = 1
+start = "plan"
+
+[stages.plan]
+kind = "agent"
+mode = "read"
+prompt = "plan.md.j2"
+schema = "plan"
+on = { ready = "approve", needs_decision = "@blocked" }
+
+# Only active when the repo policy is `always`, or the issue carries
+# factory:approve-plan; otherwise it passes straight through as `approved`.
+[stages.approve]
+kind = "gate"
+on = { approved = "implement", rejected = "@blocked" }
+
+[stages.implement]
+kind = "agent"
+mode = "write"
+prompt = "implement.md.j2"
+on = { success = "verify", failure = "@blocked" }
+
+# Always runs the .factory/ snapshot taken at the run's base commit.
+[stages.verify]
+kind = "command"
+run = ".factory/verify.sh"
+timeout = "30m"
+network = "none"
+max_visits = 5
+on = { success = "review", failure = "fix" }
+
+# Fresh context plus a host-built handoff: plan, diff stat, verify output tail.
+[stages.fix]
+kind = "agent"
+mode = "write"
+prompt = "fix.md.j2"
+max_visits = 3
+on = { success = "verify", failure = "@blocked" }
+
+# Fresh context, read-only. Advisory: a quality check, not a security control.
+[stages.review]
+kind = "agent"
+mode = "read"
+prompt = "review.md.j2"
+schema = "review"
+max_visits = 2
+on = { approve = "@publish", changes_requested = "fix" }
+exhausted = "@publish"
+```
+
+**Rules:**
+
+- **Visit caps.** Each stage has a `max_visits` (default 1). When a stage would be entered beyond its cap, the run goes to the stage's `exhausted` target (default `@blocked`). Total work is therefore bounded by Σ `max_visits`, so every valid workflow terminates.
+- **Validation.** Every referenced stage exists, every outcome label a stage can produce has a route, every stage is reachable from `start`, and `@publish` is reachable.
+- **Repeat-failure breaker.** If verify fails twice with the same normalised output, the run goes to `@blocked` rather than spending the remaining visits.
+- **Per-repo overrides.** A target repo may provide `.factory/workflow.toml` and `.factory/prompts/*.md.j2`. dsf reads them from the **default branch at claim time** and snapshots them into the run, so the agent cannot change the rules it is running under.
+- **Clamping.** Repo files may only tune what the operator allows. Visit counts and timeouts are clamped to host caps. Images, mounts, resource limits, agent-stage networking and protected paths are not settable from a repo at all. Publishing is built in and not configurable.
+- **Prompts** are minijinja templates. The defaults are embedded in the binary.
+
+## 5. Run state, suspension and resume
+
+State lives in SQLite as plain rows, updated in one transaction at each stage boundary. Stage boundaries are the only points a run can stop and resume.
+
+| Table | Purpose |
+|---|---|
+| `runs` | Status, suspend reason, `resume_after`, next stage, visit counts, `base_sha`, `checkpoint_sha`, the workflow snapshot and hash, an issue snapshot (title, body, author, `updated_at`), the plan, the approval comment id, the last failure signature, the PR number |
+| `stage_attempts` | One row per stage attempt: visit number, status, outcome, failure class, container id, before and after SHAs, exit code, usage, structured output |
+| `events` | A human-readable timeline for the board and digest. Not the source of truth. |
+| `kv` | Factory-wide state such as `backoff_until` and `paused` |
+
+A run moves `queued → running → suspended{approval | usage_limit | interrupted} → queued → …`. It ends in one of `published`, `blocked`, `publish_failed` or `canceled`.
+
+Resuming a run always resets the worktree to `checkpoint_sha`, cleans it, and executes `next_stage`.
+
+- **Crash or restart.** On startup, containers labelled with an unfinished attempt are removed and the attempt is marked `interrupted`; the stage then re-runs. An interruption does not consume a visit, but two in a row block the run.
+- **Usage limit.** The run is suspended and the issue relabelled `factory:ready`, with claiming paused until the limit resets. On the next claim the suspended run resumes if the issue is unchanged since its snapshot; otherwise a fresh run supersedes it.
+- **Approval gate.** The plan is posted as an issue comment carrying a `dsf:run=<id>` marker, and the issue is labelled `factory:awaiting-approval`. The run continues only when `factory:plan-approved` is added *after* that comment, by an allowlisted user. Rejection is a human relabelling `factory:ready` after editing the spec, which produces a fresh run. An unanswered gate expires to `@blocked` after a configurable number of days. Silence never approves.
+
+A unique index on `(repo, issue)` over non-terminal runs prevents double claims. Resumed runs still respect the window.
+
+## 6. Security model
+
+**Threat model.** The agent is capable and may be steered by hostile text: a prompt injection in an issue, a comment, a dependency or the repo itself. Assume it will try to:
+
+- obtain credentials;
+- execute code on the host;
+- weaken the checks that judge its work;
+- exfiltrate data.
+
+The controls below are what make dsf safe to leave running unattended. [`CLAUDE.md`](../CLAUDE.md) lists them as invariants.
+
+1. **Host-side git with an isolated git directory.**
+   - Each run has `runs/<id>/repo.git` (non-bare) and `runs/<id>/work`. Containers mount the worktree, and `.git` only read-only. The agent can therefore never write hooks, config, refs, objects or the index, so nothing it does can make a host git command run its code (`core.hooksPath`, `core.fsmonitor`, filter drivers, `includeIf`, `insteadOf` and similar).
+   - Every host git call goes through one `HostGit` wrapper:
+     - fixed argv;
+     - a cleared environment (`GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`, an empty `HOME`, `GIT_TERMINAL_PROMPT=0`);
+     - `-c core.hooksPath=/dev/null -c core.fsmonitor=false -c commit.gpgsign=false`;
+     - `--no-verify`.
+   - Diffs are computed between recorded SHAs (`base_sha`, `checkpoint_sha`), never against refs the agent could influence.
+   - Pushes use an explicit URL and `<sha>:refs/heads/factory/issue-<n>`. Authentication is a URL-scoped `http.extraheader` passed through `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_*` environment variables, so the token is never written to disk.
+2. **No symlink following.** The host never follows symlinks in a worktree. Agent outputs are read from Claude's stream-json result or from git objects (`git cat-file`). Trees containing gitlinks, `.gitmodules` or symlinks that escape the repo are refused.
+3. **Protected paths.** After **every** agent stage, the change since `base_sha` is checked against `.factory/`, `.github/`, `.claude/`, `.mcp.json` and any operator additions. A violation is deterministic and blocks the run immediately.
+4. **Hardened containers.**
+   - Settings: non-root user, `cap-drop ALL`, `no-new-privileges`, a read-only root filesystem with tmpfs `/tmp` and `HOME`, PID, memory and CPU limits, and no Docker socket.
+   - Environment: cleared, with an allowlist. Only `CLAUDE_CODE_OAUTH_TOKEN` and proxy settings reach agent containers, and verify containers receive no secrets.
+   - Labels: `dsf.run` and `dsf.attempt`, used for reconciliation and cleanup.
+   - Claude Code is never run with `--bare`, which ignores OAuth.
+5. **Egress.**
+   - Agent containers sit on an internal Docker network whose only exit is dsf's allowlisting CONNECT proxy (`HTTPS_PROXY`). The default allowlist is the Anthropic endpoints plus the operator's package registries.
+   - Verify has no network by default; a repo may opt in to the proxy.
+   - DNS filtering on the host is a useful second layer, not a substitute.
+6. **Secret hygiene.**
+   - Tokens are held in `secrecy` types.
+   - A masker redacts every known secret value from everything that leaves the host: logs, board pages, GitHub comments and PR bodies, digests.
+   - Before any push, the exact diff is scanned for literal secret values.
+7. **Trusted input only.**
+   - dsf acts only on configured repos, and only on issues whose author **and** the user who applied `factory:ready` are on the operator allowlist, verified through the issue events API. This matters because repos, including this one, may be public.
+   - Only allowlisted users' comments are included in prompts.
+   - If the issue body changes after claiming, the run re-plans.
+
+**Accepted residual risks:**
+
+- The Claude token is necessarily inside the agent container, so a compromised agent can misuse it within the subscription's limits. The egress allowlist limits where it could send it.
+- The `factory` user's Docker access is root-equivalent on the host. The dedicated VM is the containment.
+
+## 7. Board, digest and configuration
+
+- **Board.** axum and server-rendered HTML (maud), refreshed by htmx polling every few seconds. It has no mutating routes, and every view is masked. Pages: the overview (queue, running, backoff, window), run detail (stage timeline, logs, diff stat, PR link) and history.
+- **Digest.** Built from SQLite: draft PRs opened, runs blocked with reasons, queue depth and any active backoff. It is posted as an Adaptive Card.
+- **Configuration.** A single file, conventionally `/etc/dsf/config.toml`, sets:
+  - repos and per-repo approval policy (`never`, `label` or `always`);
+  - the user allowlist;
+  - the window and worker count;
+  - caps;
+  - the egress allowlist;
+  - image references;
+  - paths.
+
+  Secrets come from systemd credentials or an environment file. The repo ships only `examples/config.toml`, with placeholders.
+
+## 8. Repo layout and stack
+
+```
+crates/dsf-core/      pure domain model (no IO, enforced in CI)
+crates/dsf/           the binary: cli, serve, github, hostgit, sandbox, agent, proxy, store, scheduler, digest, web
+crates/fake-claude/   test-only: deterministic stream-json emitter driven by scenario files
+defaults/             default workflow and prompt templates (embedded)
+worker/Dockerfile     agent image: Node, pinned Claude Code, git, common toolchains, non-root
+examples/             config and target-repo .factory/ examples
+docs/                 this document and operations notes
+.factory/verify.sh    the gate; also what CI runs
+```
+
+| Need | Crate |
+|---|---|
+| Async runtime, HTTP server, HTML | tokio, axum, maud (+ vendored htmx) |
+| Docker | bollard |
+| GitHub | reqwest (rustls) with about ten hand-written endpoints |
+| Storage | rusqlite (bundled) + rusqlite_migration |
+| CLI, config, templates | clap, serde, toml, minijinja |
+| Errors, logging | thiserror, anyhow, tracing |
+| Secrets, time | secrecy, jiff (DST-correct scheduling) |
+| Tests | insta, wiremock, proptest, tempfile, assert_cmd |
+
+## 9. What comes from Fabro, and what doesn't
+
+**Adopted:**
+- Outcome-routed stages with visit caps.
+- Bounded verify→fix loops and a repeat-failure breaker.
+- Fail-closed human gates.
+- A git checkpoint commit per stage.
+- Publishing as a separate, non-agent step with its own `publish_failed` outcome.
+- Per-stage artefacts.
+- An allowlisted environment for every container.
+- A secret masker.
+- A `doctor` command.
+- Scripted fake agents and snapshot tests.
+
+**Deliberately not adopted:**
+
+| Not adopted | Why |
+|---|---|
+| The DOT/Petri graph engine | A TOML stage graph is enough |
+| Multi-provider model routing and failover | One subscription, so pausing on limits is the right behaviour |
+| Cloud sandboxes | Out of scope |
+| Multi-user auth and a GitHub App wizard | Single user |
+| An SPA and OpenAPI codegen | Server-rendered HTML is enough |
+| Pushing from inside the sandbox with a token present | Breaks the credentials invariant (§6) |
+| Repo-defined hooks or MCP servers executed on the host | Host code execution from repo-controlled files |
+| Auto-merge | Draft PRs only |
+
+## Open questions (spikes)
+
+| # | Question | Status |
+|---|---|---|
+| S1 | Does Claude Code authenticate with `CLAUDE_CODE_OAUTH_TOKEN` in the hardened container (read-only root, tmpfs `HOME`, non-root)? What exactly do `--json-schema` and `--restricted -p` emit in stream-json? | open |
+| S2 | With `.git` mounted read-only, does Claude Code still get useful git context (`status`, `log`, `diff`)? Do host-side commits from the separate git directory work as designed? | open |
+| S3 | Does Claude Code work through an internal Docker network plus a CONNECT proxy? Should the proxy be a sidecar container or bound on the host, and how does that interact with a host firewall (UFW)? | open |
+| S4 | What does a subscription usage-limit error look like in stream-json and on stderr, and does it carry a reset time? | open |
+
+Findings go into this document, and sanitised stream-json captures go under `crates/dsf/tests/fixtures/` as parser test fixtures.
+
+## Phases and exit criteria
+
+| Phase | Exit criteria |
+|---|---|
+| S — spikes | The four questions above answered here; fixtures committed |
+| P0 — foundations | CI green; `.factory/verify.sh` passes |
+| P1 — core model | Default workflow validates; property test shows termination within Σ `max_visits`; routing, clamping and DST window tests; `dsf-core` has no IO dependencies |
+| P2 — local engine | A fake agent in real Docker produces checkpoints, the verify/fix loop and a review, and publishes to a `file://` remote. The hostile-worktree suite passes (hooks, fsmonitor, filters, symlink escapes, verify tampering, `.gitmodules`, secrets in diffs are all refused). A kill-and-resume test passes. No `GH_`/`GITHUB_` variables in any container. |
+| P3 — GitHub | Mocked-API suite covers claiming, the allowlist, blocked-by, comment filtering, idempotent publishing and a stale label list (no double claims). One real draft PR on a sandbox repo. |
+| P4 — daemon | Clock-injected scenario tests: window, backoff, usage-limit requeue and resume, approval suspend/resume/expiry, restart reconciliation. Digest snapshot. `dsf doctor` passes. |
+| P5 — packaging | A tag publishes a static x86_64 musl binary with checksums, and a worker image with a pinned Claude Code version |
+| P6 — first deployment | A real overnight run produces a draft PR. An agent container provably cannot reach a non-allowlisted host. The digest arrives. dsf opens its first draft PR against itself. |
+| P7 — board | HTML snapshots from a fixture database; a route-enumeration test finds no mutating routes; logs are masked |

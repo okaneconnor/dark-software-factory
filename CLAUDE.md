@@ -1,0 +1,48 @@
+# Working on dsf
+
+Conventions for anyone changing this repo, human or agent. This includes the factory itself once it builds dsf. The design is in [`docs/design.md`](docs/design.md); read its security model before touching git, containers or GitHub code.
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| `.factory/verify.sh` | The gate: `cargo fmt --check`, clippy with `-D warnings`, all tests. CI runs exactly this. A change is not done until it passes. |
+| `cargo test -p dsf-core` | Fast loop for the pure core. |
+| `cargo deny check` | Licences, advisories and sources. Runs in CI. |
+
+The toolchain is pinned in `rust-toolchain.toml`.
+
+## Layout
+
+- `crates/dsf-core` is the pure domain model: config, workflows, routing, labels and scheduling rules. **No IO** of any kind: no `std::fs`, `std::process`, network, async runtime or clock reads. Pass time and data in as arguments. This keeps the logic that decides what the factory does deterministic and exhaustively testable.
+- `crates/dsf` is the binary, and owns every side effect: git, Docker, GitHub, storage, the web board.
+
+## Code rules
+
+- Lints are workspace-wide (`Cargo.toml`). `unsafe` is forbidden, and `unwrap`/`expect` are denied outside tests. Return errors instead.
+- Errors: `thiserror` types in `dsf-core`, `anyhow` with context at the binary's edges.
+- New behaviour comes with tests. Use unit tests in `dsf-core`, `insta` snapshots for rendered output (prompts, PR bodies, cards, HTML), and `assert_cmd` for the CLI.
+- Match the surrounding code. Keep modules small and focused, and make comments explain *why*, not *what*.
+- Adding a dependency means checking its licence against `deny.toml`. Prefer a few well-known crates over many small ones.
+
+## Security invariants
+
+These are the reasons this project exists rather than using an off-the-shelf tool. Never weaken one without updating `docs/design.md` (Security model) in the same change and saying so in the PR.
+
+1. No GitHub credential ever enters an agent or verify container. The host clones, commits and pushes.
+2. Host git runs only through the `HostGit` wrapper: fixed argv, cleared environment, hooks/fsmonitor/signing disabled. The agent can never write the git directory.
+3. The host never follows symlinks in a run's worktree. Agent output is read from the stream-json result or from git objects.
+4. Changes to protected paths (`.factory/`, `.github/`, `.claude/`, `.mcp.json`) block the run. Verify always uses the `.factory/` snapshot taken at the run's base commit.
+5. Containers are non-root, with `cap-drop ALL`, `no-new-privileges`, a read-only root filesystem, resource limits and an allowlisted environment, and never get the Docker socket. Agent egress goes only through the allowlisting proxy.
+6. Everything that leaves the host (logs, the board, GitHub comments and PRs, Teams) passes through the secret masker.
+7. The factory acts only on issues in configured repos that were authored **and** labelled `factory:ready` by allowlisted users.
+
+## Don't
+
+- Don't put environment-specific values in this repo: hostnames, IPs, tokens, real repo lists. It is public. Deployment config lives elsewhere; examples use placeholders.
+- Don't modify `.factory/` or `.github/` from a factory run. The factory refuses those diffs anyway.
+- Don't add a mutating route to the web board. It is read-only by design.
+
+## Commits and PRs
+
+Commit subjects are imperative and in sentence case; the body explains why. One logical change per commit. No AI attribution trailers.
