@@ -1,0 +1,25 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT"
+repository = "https://github.com/okaneconnor/dark-software-factory"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+# Pedantic is on as warnings; CI runs clippy with -D warnings, so in practice
+# everything below must be clean. The allows are the pedantic lints that cost
+# more in noise than they return for an application (not a published library).
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
