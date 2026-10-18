@@ -1,0 +1,108 @@
+---
+source: crates/dsf/src/digest.rs
+expression: "serde_json::to_string_pretty(&summary.card()).unwrap()"
+---
+{
+  "attachments": [
+    {
+      "content": {
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "body": [
+          {
+            "size": "Medium",
+            "text": "dsf: 2 draft PRs, 2 blocked, 1 awaiting approval",
+            "type": "TextBlock",
+            "weight": "Bolder",
+            "wrap": true
+          },
+          {
+            "isSubtle": true,
+            "spacing": "None",
+            "text": "Since Mon 19 Oct 07:00 (Europe/London)",
+            "type": "TextBlock",
+            "wrap": true
+          },
+          {
+            "spacing": "Medium",
+            "text": "Draft PRs (2)",
+            "type": "TextBlock",
+            "weight": "Bolder",
+            "wrap": true
+          },
+          {
+            "spacing": "Small",
+            "text": "- [octo/calc#3](https://github.com/octo/calc/pull/10) mean() of nothing: draft PR #10\n- [octo/calc#2](https://github.com/octo/calc/pull/9) add() subtracts: draft PR #9",
+            "type": "TextBlock",
+            "wrap": true
+          },
+          {
+            "spacing": "Medium",
+            "text": "Blocked (2)",
+            "type": "TextBlock",
+            "weight": "Bolder",
+            "wrap": true
+          },
+          {
+            "spacing": "Small",
+            "text": "- [octo/calc#5](https://github.com/octo/calc/issues/5) Docs: couldn't publish: the push was rejected\n- [octo/calc#4](https://github.com/octo/calc/issues/4) Make it fast: the plan needs a decision: which inputs are slow?",
+            "type": "TextBlock",
+            "wrap": true
+          },
+          {
+            "spacing": "Medium",
+            "text": "Awaiting plan approval (1)",
+            "type": "TextBlock",
+            "weight": "Bolder",
+            "wrap": true
+          },
+          {
+            "spacing": "Small",
+            "text": "- octo/calc#6  Rename calc  (run 6, plan posted Tue 20 Oct 05:00, expires Fri 23 Oct 05:00)",
+            "type": "TextBlock",
+            "wrap": true
+          },
+          {
+            "spacing": "Medium",
+            "text": "Ready (1)",
+            "type": "TextBlock",
+            "weight": "Bolder",
+            "wrap": true
+          },
+          {
+            "spacing": "Small",
+            "text": "- octo/calc#7  Support floats",
+            "type": "TextBlock",
+            "wrap": true
+          },
+          {
+            "facts": [
+              {
+                "title": "Usage",
+                "value": "no reading yet; cap 80% of the weekly allowance"
+              },
+              {
+                "title": "Claiming",
+                "value": "allowed"
+              },
+              {
+                "title": "Window",
+                "value": "23:00-07:00, closed until Tue 20 Oct 23:00"
+              },
+              {
+                "title": "Last tick",
+                "value": "Tue 20 Oct 06:55"
+              }
+            ],
+            "spacing": "Medium",
+            "type": "FactSet"
+          }
+        ],
+        "type": "AdaptiveCard",
+        "version": "1.4"
+      },
+      "contentType": "application/vnd.microsoft.card.adaptive",
+      "contentUrl": null
+    }
+  ],
+  "type": "message"
+}

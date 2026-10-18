@@ -4,7 +4,8 @@
 # separate files (see docs/design.md).
 # Check a config with `dsf config validate <file>`.
 
-# IANA time zone for the window and the digest.
+# IANA time zone for the window, `dsf status` and the digest. When the
+# digest goes out is dsf-digest.timer's setting.
 timezone = "Europe/London"
 
 # Parallel runs, 1 or 2.
@@ -12,9 +13,6 @@ workers = 1
 
 # New work starts only inside this local-time window. Running work finishes.
 window = { start = "23:00", end = "07:00" }
-
-# When the morning digest is sent.
-digest_at = "07:00"
 
 # How long a posted plan waits for factory:plan-approved before blocking.
 approval_expiry = "3d"

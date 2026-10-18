@@ -362,3 +362,121 @@ async fn a_tick_outside_the_window_records_the_queue_for_status() {
     );
     assert_eq!(fake.writes().await, Vec::<String>::new());
 }
+
+#[test]
+fn digest_prints_without_a_webhook_and_records_when_it_went_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let (config, _) = github_setup(dir.path());
+    let digest = |dry_run: bool| {
+        let mut command = dsf();
+        command
+            .arg("digest")
+            .arg("--config")
+            .arg(&config)
+            .env("HOME", dir.path())
+            .env_remove("CREDENTIALS_DIRECTORY");
+        if dry_run {
+            command.arg("--dry-run");
+        }
+        stdout(&mut command)
+    };
+    let preview = digest(true);
+    assert!(
+        preview.starts_with("dsf: nothing finished\nSince "),
+        "{preview}"
+    );
+    assert!(
+        preview.contains("Warning: dsf has never ticked; is dsf-tick.timer enabled?"),
+        "{preview}"
+    );
+    let state = dir.path().join("state/dsf.sqlite");
+    let recorded = || {
+        dsf::store::Store::open(&state)
+            .unwrap()
+            .kv_get(dsf::digest::LAST_DIGEST)
+            .unwrap()
+    };
+    assert_eq!(recorded(), None, "a dry run records nothing");
+
+    assert_eq!(digest(false), preview);
+    assert!(recorded().is_some());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn doctor_reports_each_problem_with_its_fix() {
+    let server = MockServer::start().await;
+    let ok = |body| ResponseTemplate::new(200).set_body_json(body);
+    Mock::given(method("GET"))
+        .and(path("/app"))
+        .respond_with(ok(json!({ "slug": "dsf-test" })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/octo/calc/installation"))
+        .respond_with(ok(json!({ "id": 7 })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/app/installations/7/access_tokens"))
+        .respond_with(
+            ResponseTemplate::new(201).set_body_json(
+                json!({ "token": "ghs_test", "expires_at": "2099-01-01T00:00:00Z" }),
+            ),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/octo/calc"))
+        .respond_with(ok(json!({ "default_branch": "main" })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/octo/calc/labels"))
+        .respond_with(ok(json!([{ "name": "factory:ready" }])))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/octo/calc/contents/.factory/verify.sh"))
+        .respond_with(ok(json!({ "type": "file" })))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (config, key) = github_setup(dir.path());
+    let state = dir.path().join("state");
+    std::fs::create_dir(&state).unwrap();
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let output = dsf()
+        .arg("doctor")
+        .arg("--config")
+        .arg(&config)
+        .arg("--github-key")
+        .arg(&key)
+        .arg("--github-api")
+        .arg(server.uri())
+        .env("HOME", dir.path())
+        .env_remove("CREDENTIALS_DIRECTORY")
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let report = String::from_utf8(output.stdout).unwrap();
+    let token = dir.path().join(".config/dsf/claude-oauth-token");
+    for line in [
+        "ok    config: ".to_owned(),
+        "ok    state directory: ".to_owned(),
+        format!("FAIL  Claude token: {} is missing", token.display()),
+        "ok    GitHub App key: ".to_owned(),
+        "note  Teams webhook: none, so the digest is printed to the journal".to_owned(),
+        "ok    GitHub App: acting as dsf-test[bot]".to_owned(),
+        "warn  octo/calc: missing labels factory:draft, factory:running".to_owned(),
+    ] {
+        assert!(report.contains(&line), "{line:?} not in:\n{report}");
+    }
+    assert!(
+        report.contains("run `dsf labels init octo/calc`"),
+        "{report}"
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("check(s) failed"), "{stderr}");
+}

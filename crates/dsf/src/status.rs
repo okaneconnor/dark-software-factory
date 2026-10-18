@@ -82,57 +82,50 @@ impl Board {
     /// The time, the window, usage, whether claiming is allowed, and the
     /// last tick.
     fn header(&self, config: &Config, tz: &TimeZone) -> String {
-        let at = |when: Timestamp| local(when, tz);
-        let mut out = format!("dsf at {} ({})\n", at(self.now), config.timezone);
-        let window = &config.window;
-        let hours = format!(
-            "{}-{}",
-            window.start.strftime("%H:%M"),
-            window.end.strftime("%H:%M")
-        );
-        let _ = if window.start == window.end {
-            writeln!(out, "Window:   always open")
-        } else if window.is_open(self.now, tz) {
-            let closes = next_daily(window.end, self.now, tz);
-            writeln!(out, "Window:   {hours}, open until {}", at(closes))
-        } else {
-            let opens = window.next_open(self.now, tz);
-            writeln!(out, "Window:   {hours}, closed until {}", at(opens))
-        };
+        let mut out = format!("dsf at {} ({})\n", local(self.now, tz), config.timezone);
+        let _ = writeln!(out, "Window:   {}", window_text(config, tz, self.now));
         let cap = config.weekly_usage_cap;
         let _ = writeln!(out, "Usage:    {}", self.usage_text(cap, tz));
+        let _ = writeln!(out, "Claiming: {}", self.claiming_text(config, tz));
+        let _ = writeln!(out, "Last tick: {}", self.last_tick_text(tz));
+        out
+    }
+
+    /// Whether claiming is allowed, and if not, why and until when.
+    pub fn claiming_text(&self, config: &Config, tz: &TimeZone) -> String {
+        let cap = config.weekly_usage_cap;
         let capped = self.usage.as_ref().and_then(|reading| {
             let until = reading.capped_until(cap, self.now)?;
             // A longer backoff is the real wait.
             let longest = self.backoff_until.is_none_or(|backoff| backoff <= until);
             longest.then_some((reading, until))
         });
-        let claiming = if let Some(reason) = &self.paused {
+        if let Some(reason) = &self.paused {
             format!("paused ({reason}); `dsf unpause` restarts it")
         } else if let Some((reading, until)) = capped {
             format!(
                 "{}, so nothing starts until {}",
                 reading.over_cap(cap),
-                at(until)
+                local(until, tz)
             )
         } else if let Some(until) = self.backoff_until {
-            format!("backing off after a usage limit until {}", at(until))
+            format!("backing off after a usage limit until {}", local(until, tz))
         } else {
             "allowed".to_owned()
-        };
-        let _ = writeln!(out, "Claiming: {claiming}");
-        let _ = match &self.last_tick {
-            Some(tick) => writeln!(out, "Last tick: {}", at(tick.at)),
-            None => writeln!(out, "Last tick: never"),
-        };
-        out
+        }
+    }
+
+    pub fn last_tick_text(&self, tz: &TimeZone) -> String {
+        self.last_tick
+            .as_ref()
+            .map_or_else(|| "never".to_owned(), |tick| local(tick.at, tz))
     }
 
     /// The last reading of each allowance, e.g. `weekly 62% (resets Thu
     /// 22 Oct 10:00), 5-hour 12% (resets ...); cap 80%, read Mon 19 Oct
     /// 23:20`. A window that has reset since is marked so, since its
     /// figure is out of date.
-    fn usage_text(&self, cap: u8, tz: &TimeZone) -> String {
+    pub fn usage_text(&self, cap: u8, tz: &TimeZone) -> String {
         let Some(reading) = &self.usage else {
             return format!("no reading yet; cap {cap}% of the weekly allowance");
         };
@@ -162,7 +155,8 @@ impl Board {
         format!("{windows}; cap {cap}%, read {}", local(reading.seen_at, tz))
     }
 
-    fn columns(&self, config: &Config, tz: &TimeZone) -> Columns {
+    /// The board's columns, one line per card.
+    pub fn columns(&self, config: &Config, tz: &TimeZone) -> Columns {
         let at = |when: Timestamp| local(when, tz);
         let mut columns = Columns::default();
         let queue = self.last_tick.as_ref().map_or(&[][..], |t| &t.queue[..]);
@@ -258,13 +252,34 @@ impl Board {
     }
 }
 
-#[derive(Default)]
-struct Columns {
-    ready: Vec<String>,
-    running: Vec<String>,
-    awaiting: Vec<String>,
-    review: Vec<String>,
-    blocked: Vec<String>,
+#[derive(Debug, Default)]
+pub struct Columns {
+    pub ready: Vec<String>,
+    pub running: Vec<String>,
+    pub awaiting: Vec<String>,
+    pub review: Vec<String>,
+    pub blocked: Vec<String>,
+}
+
+/// The window's hours and when it next opens or closes.
+pub fn window_text(config: &Config, tz: &TimeZone, now: Timestamp) -> String {
+    let window = &config.window;
+    let hours = format!(
+        "{}-{}",
+        window.start.strftime("%H:%M"),
+        window.end.strftime("%H:%M")
+    );
+    if window.start == window.end {
+        "always open".to_owned()
+    } else if window.is_open(now, tz) {
+        let closes = next_daily(window.end, now, tz);
+        format!("{hours}, open until {}", local(closes, tz))
+    } else {
+        format!(
+            "{hours}, closed until {}",
+            local(window.next_open(now, tz), tz)
+        )
+    }
 }
 
 /// `owner/repo#N  title  (run N`, closed by the caller.

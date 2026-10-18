@@ -296,6 +296,21 @@ impl GitHub {
             .await?)
     }
 
+    /// Whether `path` exists on `branch`.
+    pub async fn has_file(&self, repo: &RepoSlug, path: &str, branch: &str) -> Result<bool> {
+        let token = self.token(repo, Scope::Read).await?;
+        let mut segments = vec!["repos", repo.owner.as_str(), repo.name.as_str(), "contents"];
+        segments.extend(path.split('/'));
+        let mut url = self.url(&segments);
+        url.query_pairs_mut().append_pair("ref", branch);
+        let response = self.request(Method::GET, url, &token, None).await?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        check(response).await?;
+        Ok(true)
+    }
+
     pub async fn issue(&self, repo: &RepoSlug, number: u64) -> Result<Issue> {
         let token = self.token(repo, Scope::Issues).await?;
         let url = self.issue_url(repo, number, &[]);
@@ -618,7 +633,7 @@ fn next_page(headers: &HeaderMap) -> Option<String> {
 }
 
 /// reqwest is built without a default crypto provider; dsf uses ring's.
-fn install_crypto() {
+pub(crate) fn install_crypto() {
     // Fails only if a provider is already installed, which is fine.
     let _ = rustls::crypto::ring::default_provider().install_default();
 }

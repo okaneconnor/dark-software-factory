@@ -36,7 +36,6 @@ pub struct Config {
     pub timezone: String,
     pub workers: usize,
     pub window: Window,
-    pub digest_at: Time,
     /// How long a plan waits for approval before the run is blocked.
     pub approval_expiry: Duration,
     /// Percent of the weekly allowance after which no agent stage starts
@@ -141,7 +140,6 @@ impl Config {
 struct RawConfig {
     timezone: String,
     workers: Option<usize>,
-    digest_at: Option<String>,
     approval_expiry: Option<String>,
     weekly_usage_cap: Option<u8>,
     state_dir: Option<PathBuf>,
@@ -300,10 +298,6 @@ impl RawConfig {
         }
 
         let workers = check.number("workers", self.workers, 1, (1, MAX_WORKERS));
-        let digest_at = match self.digest_at.as_deref() {
-            Some(text) => check.time("digest_at", text),
-            None => jiff::civil::time(7, 0, 0, 0),
-        };
         let approval_expiry = check.duration(
             "approval_expiry",
             self.approval_expiry.as_deref(),
@@ -431,7 +425,6 @@ impl RawConfig {
             timezone,
             workers,
             window,
-            digest_at,
             approval_expiry,
             weekly_usage_cap,
             state_dir,
@@ -523,7 +516,6 @@ mod tests {
     fn minimal_config_gets_the_agreed_defaults() {
         let config = Config::parse(MINIMAL).unwrap();
         assert_eq!(config.workers, 1);
-        assert_eq!(config.digest_at, jiff::civil::time(7, 0, 0, 0));
         assert_eq!(config.window.start, jiff::civil::time(23, 0, 0, 0));
         assert_eq!(config.window.end, jiff::civil::time(7, 0, 0, 0));
         assert_eq!(config.approval_expiry, 3 * DAY);
@@ -588,7 +580,7 @@ mod tests {
     fn reports_every_problem_at_once() {
         let toml = r#"
             timezone = ""
-            digest_at = "7am"
+            approval_expiry = "soon"
             state_dir = "relative/dir"
             window = { start = "23:00", end = "25:00" }
             [github]
@@ -612,7 +604,7 @@ mod tests {
             fields(toml),
             [
                 "timezone",
-                "digest_at",
+                "approval_expiry",
                 "state_dir",
                 "window.end",
                 "github.allowed_users",

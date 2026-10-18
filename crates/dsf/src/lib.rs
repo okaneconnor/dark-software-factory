@@ -2,6 +2,8 @@
 //! and the board. The rules that decide what happens live in `dsf-core`.
 
 pub mod agent;
+pub mod digest;
+pub mod doctor;
 pub mod engine;
 pub mod factory;
 pub mod github;

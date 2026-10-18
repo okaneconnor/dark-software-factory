@@ -128,6 +128,28 @@ impl Sandbox {
         Ok(())
     }
 
+    /// The Docker engine's version, e.g. `27.3.1`.
+    pub async fn version(&self) -> Result<String> {
+        let version = self
+            .docker
+            .version()
+            .await
+            .context("asking Docker its version")?;
+        Ok(version.version.unwrap_or_else(|| "unknown".to_owned()))
+    }
+
+    /// Whether `image` is on this host. dsf never pulls images: the
+    /// operator installs them, pinned.
+    pub async fn has_image(&self, image: &str) -> Result<bool> {
+        match self.docker.inspect_image(image).await {
+            Ok(_) => Ok(true),
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(false),
+            Err(error) => Err(error).with_context(|| format!("looking for image {image}")),
+        }
+    }
+
     /// Runs `spec` to completion, writing its stdout and stderr to files.
     /// `on_created` gets the container id before it starts, so it can be
     /// recorded for cleanup if dsf dies mid-stage. The container is always
