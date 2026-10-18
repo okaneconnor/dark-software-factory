@@ -1,0 +1,76 @@
+#!/bin/sh
+# A stand-in for Claude Code in dsf's tests. It finds the stage and visit
+# in the prompt's `dsf-stage:` marker and picks its action from a
+# `fake-<stage>: <action>[,<action>...]` line in the issue: one action per
+# visit, the last repeating. It acts on the worktree, then prints
+# stream-json the way the real CLI does.
+set -u
+
+prompt=""
+model=""
+previous=""
+for arg in "$@"; do
+  [ "$previous" = "--model" ] && model="$arg"
+  previous="$arg"
+  prompt="$arg"
+done
+
+marker=$(printf '%s\n' "$prompt" | sed -n 's/^<!-- dsf-stage: \([a-z_-]*\) visit: \([0-9]*\) -->$/\1 \2/p' | head -n 1)
+stage=${marker% *}
+visit=${marker#* }
+actions=$(printf '%s\n' "$prompt" | sed -n "s/^fake-$stage: //p" | head -n 1)
+action=$(printf '%s\n' "$actions" | awk -F, -v n="$visit" '{ if (n <= NF) print $n; else print $NF }')
+[ -n "$action" ] || action=default
+
+emit() { printf '%s\n' "$1"; }
+fix_calc() { sed -i 's/a - b/a + b/' calc.py; }
+
+emit '{"type":"system","subtype":"init","apiKeySource":"none","tools":[]}'
+structured=""
+case "$stage:$action" in
+  plan:needs_decision)
+    structured='{"outcome":"needs_decision","summary":"The issue is ambiguous.","steps":[],"questions":["Should add() accept strings?"]}' ;;
+  plan:*)
+    structured='{"outcome":"ready","summary":"Make add() add.","steps":["Change a - b to a + b in calc.py"]}' ;;
+  review:changes_requested)
+    structured='{"outcome":"changes_requested","summary":"Nearly there.","issues":["Add a regression test for add()"]}' ;;
+  review:*)
+    structured='{"outcome":"approve","summary":"Correct and minimal."}' ;;
+  *:fix-calc) fix_calc ;;
+  *:slow-fix-calc) [ "$model" = "fast" ] || sleep 120; fix_calc ;;
+  *:touch-factory) echo 'exit 0' >> .factory/verify.sh ;;
+  *:touch-github) mkdir -p .github/workflows && echo 'on: push' > .github/workflows/evil.yml ;;
+  *:escape-symlink) fix_calc; ln -s /etc/passwd passwd-link ;;
+  *:nested-repo)
+    fix_calc
+    mkdir -p vendor/lib/.git
+    printf '[core]\n\tfsmonitor = "touch /tmp/dsf-canary"\n' > vendor/lib/.git/config
+    echo x > vendor/lib/file ;;
+  *:gitmodules) fix_calc; printf '[submodule "x"]\n\tpath = x\n\turl = https://example.invalid/x\n' > .gitmodules ;;
+  *:leak-token) fix_calc; printf 'TOKEN = "ghp_%s"\n' "$(printf 'A%.0s' $(seq 1 36))" > settings.py ;;
+  *:env-names)
+    fix_calc
+    tr '\0' '\n' < /proc/1/environ | cut -d= -f1 | sort > env-names.txt
+    # With an identity set, the only thing that can stop this is the
+    # read-only git directory.
+    git -c user.name=agent -c user.email=agent@example.invalid commit -qam "agent commit" 2>/dev/null
+    echo "commit exit $?" > commit-result.txt ;;
+  *:limited)
+    if [ "$model" = "limited" ]; then
+      emit '{"type":"assistant","message":{"content":[]},"error":"rate_limit","is_api_error_message":true,"api_error":"usage_limit_reached","api_error_params":{"rate_limit_info":{"status":"rejected","resetsAt":4102444800,"rateLimitType":"five_hour"}}}'
+      emit '{"type":"result","subtype":"success","is_error":true,"result":"usage limit reached"}'
+      exit 1
+    fi
+    fix_calc ;;
+  *:fail)
+    emit '{"type":"result","subtype":"error_during_execution","is_error":true}'
+    exit 1 ;;
+  *) : ;;
+esac
+
+emit '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","unifiedWindows":{"five_hour":{"utilization":0.1,"resetsAt":4102444800}}}}'
+if [ -n "$structured" ]; then
+  emit "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"num_turns\":1,\"result\":\"done\",\"structured_output\":$structured,\"total_cost_usd\":0,\"usage\":{},\"permission_denials\":[]}"
+else
+  emit '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"result":"done","total_cost_usd":0,"usage":{},"permission_denials":[]}'
+fi
