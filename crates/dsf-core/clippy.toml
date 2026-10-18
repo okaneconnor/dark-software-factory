@@ -1,0 +1,40 @@
+# dsf-core must stay free of IO (see CLAUDE.md), so the usual ways in are
+# lint errors here. Clippy reads this file instead of the workspace one for
+# this crate, so the shared settings are repeated.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+
+disallowed-types = [
+    { path = "std::fs::File", reason = "dsf-core performs no IO" },
+    { path = "std::fs::OpenOptions", reason = "dsf-core performs no IO" },
+    { path = "std::net::TcpStream", reason = "dsf-core performs no IO" },
+    { path = "std::net::TcpListener", reason = "dsf-core performs no IO" },
+    { path = "std::net::UdpSocket", reason = "dsf-core performs no IO" },
+    { path = "std::process::Command", reason = "dsf-core performs no IO" },
+    { path = "std::time::Instant", reason = "pass time in as an argument" },
+    { path = "std::time::SystemTime", reason = "pass time in as an argument" },
+]
+
+disallowed-methods = [
+    { path = "std::fs::read", reason = "dsf-core performs no IO" },
+    { path = "std::fs::read_to_string", reason = "dsf-core performs no IO" },
+    { path = "std::fs::read_dir", reason = "dsf-core performs no IO" },
+    { path = "std::fs::write", reason = "dsf-core performs no IO" },
+    { path = "std::fs::metadata", reason = "dsf-core performs no IO" },
+    { path = "std::fs::canonicalize", reason = "dsf-core performs no IO" },
+    { path = "std::path::Path::exists", reason = "dsf-core performs no IO" },
+    { path = "std::path::Path::canonicalize", reason = "dsf-core performs no IO" },
+    { path = "std::path::Path::read_link", reason = "dsf-core performs no IO" },
+    { path = "std::env::var", reason = "pass configuration in as an argument" },
+    { path = "std::env::var_os", reason = "pass configuration in as an argument" },
+    { path = "std::env::vars", reason = "pass configuration in as an argument" },
+    { path = "std::env::args", reason = "pass configuration in as an argument" },
+    { path = "std::env::current_dir", reason = "dsf-core performs no IO" },
+    { path = "std::thread::spawn", reason = "dsf-core is synchronous and single-threaded" },
+    { path = "std::thread::sleep", reason = "pass time in as an argument" },
+    { path = "jiff::Timestamp::now", reason = "pass time in as an argument" },
+    { path = "jiff::Zoned::now", reason = "pass time in as an argument" },
+    { path = "jiff::tz::TimeZone::system", reason = "the binary resolves time zones" },
+    { path = "jiff::tz::TimeZone::get", reason = "the binary resolves time zones" },
+    { path = "jiff::tz::TimeZone::try_system", reason = "the binary resolves time zones" },
+]
