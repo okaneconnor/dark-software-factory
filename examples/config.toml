@@ -10,9 +10,6 @@ timezone = "Europe/London"
 # Parallel runs, 1 or 2.
 workers = 1
 
-# How often to look for factory:ready issues.
-poll_interval = "5m"
-
 # New work starts only inside this local-time window. Running work finishes.
 window = { start = "23:00", end = "07:00" }
 

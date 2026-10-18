@@ -277,3 +277,88 @@ fn labels_init_only_touches_configured_repos() {
         "{stderr}"
     );
 }
+
+#[test]
+fn status_pause_and_unpause_need_no_secrets() {
+    let dir = tempfile::tempdir().unwrap();
+    let (config, _) = github_setup(dir.path());
+    let status = || stdout(dsf().arg("status").arg("--config").arg(&config));
+    let idle = status();
+    assert!(
+        idle.contains("Claiming: allowed\nLast tick: never\n"),
+        "{idle}"
+    );
+    assert!(idle.contains("\nReady (0)\n"), "{idle}");
+
+    let paused = stdout(
+        dsf()
+            .args(["pause", "upgrading the VM", "--config"])
+            .arg(&config),
+    );
+    assert!(paused.starts_with("paused:"), "{paused}");
+    let shown = status();
+    assert!(
+        shown.contains("Claiming: paused (upgrading the VM); `dsf unpause` restarts it"),
+        "{shown}"
+    );
+
+    stdout(dsf().arg("unpause").arg("--config").arg(&config));
+    assert!(status().contains("Claiming: allowed"));
+}
+
+#[test]
+fn a_tick_does_nothing_while_another_dsf_holds_the_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let (config, key) = github_setup(dir.path());
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let _held = dsf::rundir::StateLock::acquire(&state).unwrap();
+    let output = stdout(
+        dsf()
+            .arg("tick")
+            .arg("--config")
+            .arg(&config)
+            .arg("--github-key")
+            .arg(&key),
+    );
+    assert!(output.starts_with("another dsf is working in"), "{output}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tick_outside_the_window_records_the_queue_for_status() {
+    if !support::enabled() {
+        return;
+    }
+    let fake = support::github::Fake::start().await;
+    let issue = support::github::issue_json(3, "alice", &["factory:ready"], "x");
+    fake.listing("factory:ready", json!([issue])).await;
+    fake.listing("factory:running", json!([])).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (config, key) = github_setup(dir.path());
+    let api = fake.server.uri();
+    let tick_config = config.clone();
+    let output = tokio::task::spawn_blocking(move || {
+        stdout(
+            dsf()
+                .arg("tick")
+                .arg("--config")
+                .arg(&tick_config)
+                .arg("--github-key")
+                .arg(&key)
+                .args(["--github-api", &api, "--egress", "none"])
+                .args(["--now", "2026-10-19T11:00:00Z"]),
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        output,
+        "outside the window, which opens at Mon 19 Oct 23:00\n"
+    );
+    let status = stdout(dsf().arg("status").arg("--config").arg(&config));
+    assert!(
+        status.contains("\nReady (1)\n  octo/calc#3  add() subtracts\n"),
+        "{status}"
+    );
+    assert_eq!(fake.writes().await, Vec::<String>::new());
+}

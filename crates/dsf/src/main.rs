@@ -25,6 +25,22 @@ struct Cli {
 enum Command {
     /// Run one issue through the factory, or resume a run.
     Run(Box<RunArgs>),
+    /// One pass of the factory: recover from any crash, look at every
+    /// configured repo, and work through the queue while the window is
+    /// open. A systemd timer runs this every few minutes.
+    Tick(Box<WorkerArgs>),
+    /// Show the queue, the runs in progress and the last week's results.
+    Status(StateArgs),
+    /// Stop claiming new work. Runs already going carry on.
+    Pause {
+        /// Why, shown by `dsf status`.
+        #[arg(default_value = "paused by the operator")]
+        reason: String,
+        #[command(flatten)]
+        state: StateArgs,
+    },
+    /// Let claiming start again after a pause.
+    Unpause(StateArgs),
     /// Check and print workflow files.
     #[command(subcommand)]
     Workflow(WorkflowCommand),
@@ -75,6 +91,13 @@ struct RunArgs {
     /// Make gate stages wait for approval.
     #[arg(long, requires = "local")]
     require_approval: bool,
+    #[command(flatten)]
+    worker: WorkerArgs,
+}
+
+/// What running stages needs, for `dsf run` and `dsf tick`.
+#[derive(clap::Args)]
+struct WorkerArgs {
     /// Where runs and their database live. Defaults to the config's
     /// `state_dir` for GitHub runs, `~/.local/state/dsf` for local ones.
     #[arg(long, value_name = "DIR")]
@@ -104,6 +127,22 @@ struct RunArgs {
     /// Longest an agent stage may run.
     #[arg(long, default_value = "45m", value_parser = parse_duration)]
     agent_timeout: Duration,
+    /// Decide as if it were this time, e.g. 2026-10-19T23:30:00Z. For
+    /// trying out the window and backoff rules.
+    #[arg(long, value_name = "TIME", hide = true)]
+    now: Option<jiff::Timestamp>,
+}
+
+/// Where the run state is, for commands that only read or flag it.
+#[derive(clap::Args)]
+struct StateArgs {
+    /// The config file. Defaults to `$DSF_CONFIG`, then
+    /// `~/.config/dsf/config.toml` if it exists, then `/etc/dsf/config.toml`.
+    #[arg(long, value_name = "FILE")]
+    config: Option<PathBuf>,
+    /// Overrides the config's `state_dir`.
+    #[arg(long, value_name = "DIR")]
+    state_dir: Option<PathBuf>,
 }
 
 /// How to reach GitHub, for commands that do.
@@ -192,6 +231,10 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Run(args) => return run_issue(&args),
+        Command::Tick(args) => tick(&args),
+        Command::Status(state) => status(&state),
+        Command::Pause { reason, state } => set_paused(&state, Some(&reason)),
+        Command::Unpause(state) => set_paused(&state, None),
         Command::Workflow(WorkflowCommand::Validate { file, config }) => {
             validate_workflow(&file, config.as_deref())
         }
@@ -338,27 +381,28 @@ async fn run_issue_async(args: &RunArgs) -> Result<Outcome> {
         return run_github_issue(args, target).await;
     }
 
+    let worker = &args.worker;
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    let state_dir = state_dir(args.state_dir.as_deref(), home.as_deref(), None)?;
+    let state_dir = state_dir(worker.state_dir.as_deref(), home.as_deref(), None)?;
     let _lock = dsf::rundir::StateLock::acquire(&state_dir)?;
-    let token = claude_token(args, home.as_deref())?;
+    let token = claude_token(worker, home.as_deref())?;
     let sandbox = dsf::sandbox::Sandbox::connect()?;
     sandbox.ping().await?;
     let builtin: Vec<String> = dsf_core::config::BUILTIN_EGRESS
         .iter()
         .map(ToString::to_string)
         .collect();
-    let egress = egress(&sandbox, args, &builtin).await?;
+    let egress = egress(&sandbox, worker, &builtin).await?;
     let config = Config {
-        instance: args.instance.clone(),
+        instance: worker.instance.clone(),
         state_dir: state_dir.clone(),
-        worker_image: args
+        worker_image: worker
             .image
             .clone()
             .unwrap_or_else(|| "dsf-worker:dev".to_owned()),
-        model: args.model.clone(),
+        model: worker.model.clone(),
         max_turns: 80,
-        agent_timeout: args.agent_timeout,
+        agent_timeout: worker.agent_timeout,
         limits: dsf::sandbox::Limits::default(),
         egress,
         caps: Caps::default(),
@@ -392,30 +436,43 @@ async fn run_issue_async(args: &RunArgs) -> Result<Outcome> {
 
 /// One GitHub issue, from the config's repos, as the GitHub App.
 async fn run_github_issue(args: &RunArgs, target: &IssueRef) -> Result<Outcome> {
-    use dsf::engine::{Config as EngineConfig, Engine};
-
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    let (config, github) = connect_github(&args.github, home.as_deref())?;
+    let (config, github) = connect_github(&args.worker.github, home.as_deref())?;
     let state_dir = state_dir(
-        args.state_dir.as_deref(),
+        args.worker.state_dir.as_deref(),
         home.as_deref(),
         Some(&config.state_dir),
     )?;
     let _lock = dsf::rundir::StateLock::acquire(&state_dir)?;
-    let token = claude_token(args, home.as_deref())?;
+    let factory = github_factory(&args.worker, config, github, &state_dir, home.as_deref()).await?;
+    factory.work_on(&target.repo, target.number).await
+}
+
+/// The factory as the config's GitHub App, with stages in hardened
+/// containers behind the egress proxy. The caller holds the state lock.
+async fn github_factory(
+    worker: &WorkerArgs,
+    config: Config,
+    github: Arc<dsf::github::GitHub>,
+    state_dir: &Path,
+    home: Option<&Path>,
+) -> Result<dsf::factory::Factory> {
+    use dsf::engine::{Config as EngineConfig, Engine};
+
+    let token = claude_token(worker, home)?;
     let sandbox = dsf::sandbox::Sandbox::connect()?;
     sandbox.ping().await?;
-    let egress = egress(&sandbox, args, &config.egress).await?;
+    let egress = egress(&sandbox, worker, &config.egress).await?;
     let engine_config = EngineConfig {
-        instance: args.instance.clone(),
-        state_dir: state_dir.clone(),
-        worker_image: args
+        instance: worker.instance.clone(),
+        state_dir: state_dir.to_owned(),
+        worker_image: worker
             .image
             .clone()
             .unwrap_or_else(|| config.worker_image.clone()),
-        model: args.model.clone(),
+        model: worker.model.clone(),
         max_turns: 80,
-        agent_timeout: args.agent_timeout,
+        agent_timeout: worker.agent_timeout,
         limits: dsf::sandbox::Limits::default(),
         egress,
         caps: config.caps,
@@ -432,8 +489,76 @@ async fn run_github_issue(args: &RunArgs, target: &IssueRef) -> Result<Outcome> 
         report,
     )?
     .with_forge(Box::new(dsf::factory::GitHubForge::new(github.clone())));
-    let factory = dsf::factory::Factory::new(engine, github, config, &args.github.git_base);
-    factory.work_on(&target.repo, target.number).await
+    let mut factory = dsf::factory::Factory::new(engine, github, config, &worker.github.git_base);
+    if let Some(now) = worker.now {
+        factory = factory.with_clock(Arc::new(move || now));
+    }
+    Ok(factory)
+}
+
+fn tick(args: &WorkerArgs) -> Result<()> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let (config, github) = connect_github(&args.github, home.as_deref())?;
+    let state_dir = state_dir(
+        args.state_dir.as_deref(),
+        home.as_deref(),
+        Some(&config.state_dir),
+    )?;
+    // A systemd timer won't start a tick while one is running, but a
+    // `dsf run` might be: then this tick has nothing to do.
+    let Some(_lock) = dsf::rundir::StateLock::try_acquire(&state_dir)? else {
+        println!(
+            "another dsf is working in {}; nothing to do",
+            state_dir.display()
+        );
+        return Ok(());
+    };
+    let tz = jiff::tz::TimeZone::get(&config.timezone)?;
+    let runtime = tokio::runtime::Runtime::new()?;
+    let record = runtime.block_on(async {
+        let factory = github_factory(args, config, github, &state_dir, home.as_deref()).await?;
+        dsf::scheduler::Scheduler::new(factory, tz).tick().await
+    })?;
+    for note in &record.notes {
+        println!("{note}");
+    }
+    if record.notes.is_empty() {
+        println!("nothing to do");
+    }
+    Ok(())
+}
+
+fn status(args: &StateArgs) -> Result<()> {
+    let (config, store) = open_state(args)?;
+    let tz = jiff::tz::TimeZone::get(&config.timezone)?;
+    let board = dsf::status::Board::load(&store, jiff::Timestamp::now())?;
+    print!("{}", board.render(&config, &tz));
+    Ok(())
+}
+
+fn set_paused(args: &StateArgs, reason: Option<&str>) -> Result<()> {
+    let (_, mut store) = open_state(args)?;
+    if let Some(reason) = reason {
+        store.kv_set(dsf::scheduler::PAUSED, reason)?;
+        println!("paused: no new work starts until `dsf unpause`; runs already going carry on");
+    } else {
+        store.kv_delete(dsf::scheduler::PAUSED)?;
+        println!("claiming allowed again from the next tick");
+    }
+    Ok(())
+}
+
+/// The config and the run database, for commands that need no secrets.
+fn open_state(args: &StateArgs) -> Result<(Config, dsf::store::Store)> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let config = load_config(&config_path(args.config.as_deref(), home.as_deref()))?;
+    let state_dir = state_dir(
+        args.state_dir.as_deref(),
+        home.as_deref(),
+        Some(&config.state_dir),
+    )?;
+    let store = dsf::store::Store::open(&state_dir.join("dsf.sqlite"))?;
+    Ok((config, store))
 }
 
 fn init_labels(repo: &RepoSlug, args: &GitHubArgs) -> Result<()> {
@@ -509,7 +634,7 @@ fn state_dir(
     Ok(dir.canonicalize()?)
 }
 
-fn claude_token(args: &RunArgs, home: Option<&Path>) -> Result<secrecy::SecretString> {
+fn claude_token(args: &WorkerArgs, home: Option<&Path>) -> Result<secrecy::SecretString> {
     match (&args.token_file, args.egress) {
         (Some(file), _) => read_token(file),
         (None, EgressArg::Proxy) => read_token(&credential("claude-oauth-token", home)?),
@@ -521,7 +646,7 @@ fn claude_token(args: &RunArgs, home: Option<&Path>) -> Result<secrecy::SecretSt
 /// Sets up the agents' network and the proxy sidecar, unless offline.
 async fn egress(
     sandbox: &dsf::sandbox::Sandbox,
-    args: &RunArgs,
+    args: &WorkerArgs,
     allow: &[String],
 ) -> Result<dsf::engine::Egress> {
     const NETWORK: &str = "dsf-agents";

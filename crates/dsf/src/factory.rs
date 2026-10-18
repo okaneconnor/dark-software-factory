@@ -1,7 +1,7 @@
 //! The GitHub side of a run: whether an issue may be worked on, claiming
 //! it without racing anyone, and keeping its labels and comments in step
 //! with the run. `dsf run owner/repo#N` uses it for one issue; the
-//! scheduler will use it for each candidate.
+//! scheduler uses it for every candidate in a tick.
 //!
 //! Nothing here trusts a listing: every decision starts from a fresh read
 //! of the issue and its label history, and the claim itself is removing
@@ -15,7 +15,7 @@ use dsf_core::config::{Config, RepoSlug};
 use dsf_core::issue::{self, Candidate, SkipReason, Verdict};
 use dsf_core::labels::{self, Lifecycle};
 use futures_util::future::BoxFuture;
-use jiff::Timestamp;
+use jiff::{SignedDuration, Timestamp};
 
 use crate::engine::{self, Engine, Forge, PullRequestDraft, PullRequestRef, ResumeOptions, RunEnd};
 use crate::github::{GitHub, IssueEvent, NewPullRequest, Scope};
@@ -88,11 +88,15 @@ pub enum Outcome {
     Ended(RunEnd),
 }
 
+/// The time, from the system clock except in tests.
+pub type Clock = Arc<dyn Fn() -> Timestamp + Send + Sync>;
+
 pub struct Factory {
     engine: Engine,
     github: Arc<GitHub>,
     config: Config,
     git_base: String,
+    clock: Clock,
 }
 
 impl Factory {
@@ -103,11 +107,32 @@ impl Factory {
             github,
             config,
             git_base: git_base.to_owned(),
+            clock: Arc::new(Timestamp::now),
         }
+    }
+
+    /// Decides with `clock`'s time rather than the system's, so tests can
+    /// say when "now" is.
+    #[must_use]
+    pub fn with_clock(mut self, clock: Clock) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    pub fn now(&self) -> Timestamp {
+        (self.clock)()
     }
 
     pub fn engine(&self) -> &Engine {
         &self.engine
+    }
+
+    pub fn github(&self) -> &GitHub {
+        &self.github
+    }
+
+    pub fn config(&self) -> &Config {
+        &self.config
     }
 
     /// Looks at one issue and, if it may be worked on, works on it: a new
@@ -139,7 +164,9 @@ impl Factory {
             && run.suspend_reason == Some(SuspendReason::Approval)
             && Lifecycle::of(&labels) == Some(Lifecycle::AwaitingApproval)
         {
-            return self.after_approval(repo, run, &labels, &label_events).await;
+            return self
+                .after_approval(repo, run, &labels, &label_events, true)
+                .await;
         }
 
         let own = self.github.login().await?;
@@ -159,7 +186,7 @@ impl Factory {
         }
         if let Some(run) = &active
             && let Some(after) = run.resume_after
-            && after > Timestamp::now()
+            && after > self.now()
         {
             return Ok(Outcome::Skipped(format!(
                 "{repo}#{number}: run {} is paused until {after}",
@@ -256,14 +283,128 @@ impl Factory {
         Ok(true)
     }
 
+    /// Looks in on a paused run whose issue isn't queued: one stopped by a
+    /// crash or restart while its issue still reads `factory:running`, or
+    /// a plan waiting for approval. With `may_resume` it carries on where
+    /// it can; without, it only cancels runs whose issue was closed and
+    /// expires plans no one approved in time. A run whose issue a human has
+    /// moved elsewhere is left for them.
+    pub async fn continue_run(&self, run: &store::Run, may_resume: bool) -> Result<Outcome> {
+        let repo = match run.repo.parse::<RepoSlug>() {
+            Ok(slug) => match self.config.repo(&slug) {
+                Some(settings) => settings.slug.clone(),
+                None => {
+                    return Ok(Outcome::Skipped(format!(
+                        "run {}: {slug} is no longer one of the configured repos",
+                        run.id
+                    )));
+                }
+            },
+            Err(_) => {
+                return Ok(Outcome::Skipped(format!(
+                    "run {} is not a GitHub run",
+                    run.id
+                )));
+            }
+        };
+        let issue = self.github.issue(&repo, run.issue).await?;
+        if issue.state != "open" {
+            self.engine.cancel(run.id, "the issue was closed")?;
+            return Ok(Outcome::Skipped(format!(
+                "{repo}#{}: closed, so run {} was canceled",
+                run.issue, run.id
+            )));
+        }
+        let labels = issue.label_names();
+        match Lifecycle::of(&labels) {
+            Some(Lifecycle::AwaitingApproval)
+                if run.suspend_reason == Some(SuspendReason::Approval) =>
+            {
+                let events = self.github.issue_events(&repo, run.issue).await?;
+                let label_events: Vec<_> = events
+                    .iter()
+                    .filter_map(IssueEvent::as_label_event)
+                    .collect();
+                self.after_approval(&repo, run, &labels, &label_events, may_resume)
+                    .await
+            }
+            Some(Lifecycle::Running) if may_resume => {
+                if let Some(after) = run.resume_after
+                    && after > self.now()
+                {
+                    return Ok(Outcome::Skipped(format!(
+                        "{repo}#{}: run {} is paused until {after}",
+                        run.issue, run.id
+                    )));
+                }
+                let end = self.engine.resume(run.id, ResumeOptions::default()).await?;
+                self.report(&repo, run.issue, &end).await;
+                Ok(Outcome::Ended(end))
+            }
+            Some(Lifecycle::Ready) => Ok(Outcome::Skipped(format!(
+                "{repo}#{}: queued; run {} continues when it's claimed",
+                run.issue, run.id
+            ))),
+            _ => Ok(Outcome::Skipped(format!(
+                "{repo}#{}: run {} waits for the issue's labels to change",
+                run.issue, run.id
+            ))),
+        }
+    }
+
+    /// An issue labelled `factory:running` that no unfinished run is
+    /// working on: dsf stopped before it could update the issue, or a
+    /// person added the label. Moves it to where its last run ended, or to
+    /// `factory:blocked` if there's nothing to go on.
+    pub async fn repair(&self, repo: &RepoSlug, number: u64) -> Result<String> {
+        let latest = self.engine.store()?.latest_run(&repo.to_string(), number)?;
+        let end = latest.and_then(|run| match run.status {
+            RunStatus::Published => Some(RunEnd::Published {
+                run_id: run.id,
+                branch: format!("factory/issue-{number}"),
+                sha: run.checkpoint_sha.unwrap_or_default(),
+                pull_request: run.pr_number.map(|pr| PullRequestRef {
+                    number: pr,
+                    url: format!("{GIT_BASE}{repo}/pull/{pr}"),
+                }),
+            }),
+            RunStatus::Blocked | RunStatus::PublishFailed => Some(RunEnd::Blocked {
+                run_id: run.id,
+                reason: run.end_reason.unwrap_or_default(),
+            }),
+            _ => None,
+        });
+        if let Some(end) = end {
+            self.try_report(repo, number, &end).await?;
+            return Ok(format!(
+                "{repo}#{number}: labels brought up to date with how its last run ended"
+            ));
+        }
+        self.move_issue(repo, number, Lifecycle::Blocked).await?;
+        self.github
+            .post_comment(
+                repo,
+                number,
+                "dsf has no unfinished run for this issue, so it can't be running. \
+                 Add `factory:ready` to start again.",
+            )
+            .await?;
+        Ok(format!(
+            "{repo}#{number}: labelled factory:running with no run, so moved to factory:blocked"
+        ))
+    }
+
     /// Continues a run whose plan is waiting, if a trusted user approved it
-    /// after it was posted and the approval is still on the issue.
+    /// after it was posted and the approval is still on the issue, and
+    /// `may_resume` allows. A plan left unapproved for longer than
+    /// `approval_expiry` blocks the run: silence never approves.
     async fn after_approval(
         &self,
         repo: &RepoSlug,
         run: &store::Run,
         labels: &[String],
         events: &[issue::LabelEvent<'_>],
+        may_resume: bool,
     ) -> Result<Outcome> {
         let Some(comment_id) = run.approval_comment_id else {
             // Posting the plan failed when the run paused; post it now.
@@ -273,7 +414,25 @@ impl Factory {
         let posted = self.github.comment(repo, comment_id).await?.created_at;
         let approved = labels::has(labels, labels::PLAN_APPROVED.name)
             && issue::plan_approver(events, posted, &self.config.allowlist).is_some();
-        if !approved || run.status != RunStatus::Suspended {
+        if !approved {
+            let expiry = self.config.approval_expiry;
+            let expires = SignedDuration::try_from(expiry)
+                .ok()
+                .and_then(|wait| posted.checked_add(wait).ok())
+                .unwrap_or(Timestamp::MAX);
+            if self.now() >= expires {
+                let end = self.engine.block(
+                    run.id,
+                    &format!(
+                        "no one approved the plan within {}",
+                        dsf_core::duration::format(expiry)
+                    ),
+                )?;
+                self.report(repo, run.issue, &end).await;
+                return Ok(Outcome::Ended(end));
+            }
+        }
+        if !approved || !may_resume || run.status != RunStatus::Suspended {
             return Ok(Outcome::AwaitingApproval { run_id: run.id });
         }
         self.move_issue(repo, run.issue, Lifecycle::Running).await?;

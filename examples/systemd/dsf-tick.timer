@@ -1,0 +1,12 @@
+# Runs dsf every five minutes, all day. Outside the window a tick only
+# looks (the queue, stale labels, plans that have waited too long); the
+# window itself is set in /etc/dsf/config.toml.
+[Unit]
+Description=Run dsf every five minutes
+
+[Timer]
+OnCalendar=*:0/5
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

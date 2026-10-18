@@ -8,6 +8,8 @@
 use std::path::Path;
 use std::sync::OnceLock;
 
+pub mod github;
+
 pub const FAKE_IMAGE: &str = "dsf-fake-agent:test";
 pub const TOKEN: &str = "sk-ant-oat01-fake-token-for-tests-only-0123456789";
 

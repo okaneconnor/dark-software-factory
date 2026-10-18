@@ -1,0 +1,28 @@
+---
+source: crates/dsf/src/status.rs
+expression: "board.render(&config(), &tz)"
+---
+dsf at Mon 19 Oct 23:41 (Europe/London)
+Window:   23:00-07:00, open until Tue 20 Oct 07:00
+Claiming: paused (run 4: Claude authentication failed); `dsf unpause` restarts it
+Last tick: Mon 19 Oct 23:40
+
+Ready (2)
+  octo/calc#2  mean() of nothing  (continues run 2 after Tue 20 Oct 02:02)
+  octo/calc#7  Support floats
+
+Running (1)
+  octo/calc#1  add() subtracts  (run 1, verify, since Mon 19 Oct 23:30)
+
+Awaiting approval (1)
+  octo/calc#3  Rename calc  (run 3, plan posted Mon 19 Oct 23:15, expires Thu 22 Oct 23:15)
+
+Review, last 7 days (1)
+  octo/calc#5  Docs  (run 5, draft PR #9, Mon 19 Oct 00:40)
+
+Blocked, last 7 days (2)
+  octo/calc#4  Faster multiply  (run 4, Claude authentication failed (authentication_failed); fix the token, then resume)
+  octo/calc#6  Make it fast  (run 6, Mon 19 Oct 01:10: the plan needs a decision)
+
+Last tick's notes
+  octo/calc#8: it's blocked by open issue #7
