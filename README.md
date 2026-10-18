@@ -2,7 +2,7 @@
 
 `dsf` turns GitHub issues you have approved into verified **draft** pull requests, unattended, overnight. It drives [Claude Code](https://claude.com/claude-code) in headless mode inside locked-down containers that never hold a GitHub token, and it treats a script in the target repo as the only definition of "done".
 
-> **Status: pre-alpha, under construction.** `dsf run --local` runs an issue end to end against a local repository: plan, implement, verify, review, publish a branch. GitHub integration and the unattended daemon come next. The design is in [`docs/design.md`](docs/design.md) and progress is tracked in the [roadmap](#roadmap).
+> **Status: pre-alpha, under construction.** `dsf run owner/repo#N` takes an approved GitHub issue end to end, acting as a GitHub App: it plans, implements, verifies, reviews, then opens a draft pull request and updates the issue. `dsf run --local` does the same against a local repository. The unattended daemon comes next. The design is in [`docs/design.md`](docs/design.md) and progress is tracked in the [roadmap](#roadmap).
 
 ## How it works
 
@@ -51,8 +51,8 @@ Each target repo can tune this pipeline in `.factory/workflow.toml`, within limi
 | S | Spikes: Claude Code in a hardened container, read-only `.git`, egress proxy, usage-limit errors | Done |
 | P0 | Repo foundations: workspace, CI, gate, docs | Done |
 | P1 | Core model: workflows, routing, labels, scheduling rules | Done |
-| P2 | Local engine: host git, sandbox, agent adapter, verify loop, store | **In progress** |
-| P3 | GitHub: claiming, labels, publishing draft PRs | Planned |
+| P2 | Local engine: host git, sandbox, agent adapter, verify loop, store | Done |
+| P3 | GitHub: claiming, labels, publishing draft PRs | **In progress** |
 | P4 | Daemon: scheduler, night window, approval gate, digest | Planned |
 | P5 | Packaging: release binary and worker image | Planned |
 | P6 | First deployment and dogfooding | Planned |
