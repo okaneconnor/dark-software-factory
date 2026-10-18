@@ -260,7 +260,9 @@ defaults/             default workflow and prompt templates (embedded)
 crates/dsf/tests/fake-agent/  test-only: a shell `claude` that acts on `fake-<stage>:` lines in the
                       issue and prints stream-json, in a small Alpine image
 worker/Dockerfile     agent and verify image: Node, pinned Claude Code, git, make, Python
-docker/dsf.Dockerfile dsf itself, used for the proxy sidecar
+docker/dsf.Dockerfile dsf built from source, for the proxy sidecar in development and tests
+docker/release.Dockerfile  the released dsf image: the release binary on Debian slim
+.github/workflows/    ci.yml (the gate and cargo-deny), release.yml (tags → releases)
 examples/             config, systemd units and target-repo .factory/ examples
 docs/                 this document and operations notes
 .factory/verify.sh    the gate; also what CI runs
@@ -276,6 +278,8 @@ docs/                 this document and operations notes
 | Errors, logging | thiserror, anyhow, tracing |
 | Secrets, time | secrecy, jiff (DST-correct scheduling) |
 | Tests | insta, wiremock, proptest, tempfile, assert_cmd |
+
+**Releases.** Pushing a tag `vX.Y.Z` that matches the crate version runs `release.yml`. It builds a static `x86_64-unknown-linux-musl` binary and publishes it as `dsf-vX.Y.Z-x86_64-unknown-linux-musl.tar.gz` with a `.sha256` file. It also pushes two images to GHCR, both tagged with the version: `dsf`, the same binary on Debian slim, which runs the proxy sidecar; and `dsf-worker`, with Claude Code pinned in `worker/Dockerfile`. The release notes list both image digests, which go into the config's `[images]`; dsf never pulls, so a deployment runs exactly the images it was given. Pull requests that change the packaging build all of this without publishing. The build and publish steps are separate jobs, and only the publish job, on a tag, can write.
 
 ## 9. What comes from Fabro, and what doesn't
 
@@ -363,6 +367,6 @@ The four open questions were answered on 2026-10-18 with Claude Code 2.1.292 in 
 | P2 — local engine | A fake agent in real Docker produces checkpoints, the verify/fix loop and a review, and publishes to a `file://` remote. The hostile-worktree suite passes (hooks, fsmonitor, filters, symlink escapes, verify tampering, `.gitmodules`, secrets in diffs are all refused). A kill-and-resume test passes. No `GH_`/`GITHUB_` variables in any container. |
 | P3 — GitHub | Mocked-API suite covers claiming, the allowlist, blocked-by, comment filtering, idempotent publishing and a stale label list (no double claims). One real draft PR on a sandbox repo. |
 | P4 — unattended running | Clock-injected scenario tests for `dsf tick`: the window, pausing and backoff, usage-limit requeue and resume, the weekly usage cap, approval expiry, crash recovery and label repair. Digest snapshot. `dsf doctor` passes. |
-| P5 — packaging | A tag publishes a static x86_64 musl binary with checksums, and a worker image with a pinned Claude Code version |
+| P5 — packaging | A tag publishes a static x86_64 musl binary with checksums, and the dsf and worker images, the worker with a pinned Claude Code version |
 | P6 — first deployment | A real overnight run produces a draft PR. An agent container provably cannot reach a non-allowlisted host. The digest arrives. dsf opens its first draft PR against itself. |
 | P7 — board | The kanban overview and run pages render as HTML snapshots from a fixture database; a route-enumeration test finds no mutating routes; logs are masked |

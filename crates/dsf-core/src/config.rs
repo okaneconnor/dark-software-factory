@@ -51,6 +51,9 @@ pub struct Config {
     /// operator's, sorted and deduplicated.
     pub egress: Vec<String>,
     pub worker_image: String,
+    /// dsf's own image, which the egress proxy sidecar runs. `None` leaves
+    /// it to the command line, whose default suits development.
+    pub dsf_image: Option<String>,
     pub protected: ProtectedPaths,
     /// The operator's own protected paths, as written.
     pub protect_extra: Vec<String>,
@@ -197,6 +200,7 @@ struct RawEgress {
 #[serde(deny_unknown_fields)]
 struct RawImages {
     worker: String,
+    dsf: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -403,10 +407,19 @@ impl RawConfig {
         egress.sort();
         egress.dedup();
 
-        let worker_image = self.images.worker.trim().to_owned();
-        if worker_image.is_empty() || worker_image.contains(char::is_whitespace) {
-            check.fail("images.worker", "expected an image reference");
-        }
+        let image = |check: &mut Checker, field: &str, text: &str| {
+            let image = text.trim().to_owned();
+            if image.is_empty() || image.contains(char::is_whitespace) {
+                check.fail(field, "expected an image reference");
+            }
+            image
+        };
+        let worker_image = image(&mut check, "images.worker", &self.images.worker);
+        let dsf_image = self
+            .images
+            .dsf
+            .as_deref()
+            .map(|text| image(&mut check, "images.dsf", text));
 
         for entry in &self.protect.extra {
             if !protect::is_valid_entry(entry) {
@@ -434,6 +447,7 @@ impl RawConfig {
             caps,
             egress,
             worker_image,
+            dsf_image,
             protected,
             protect_extra: self.protect.extra,
         })
@@ -510,6 +524,10 @@ mod tests {
             )
         );
         assert!(config.egress.iter().any(|host| host == "api.anthropic.com"));
+        assert_eq!(
+            config.dsf_image.as_deref(),
+            Some("ghcr.io/your-github-login/dsf:v0.1.0")
+        );
     }
 
     #[test]
@@ -523,6 +541,7 @@ mod tests {
         assert_eq!(config.state_dir, PathBuf::from("/var/lib/dsf"));
         assert_eq!(config.caps, Caps::default());
         assert_eq!(config.egress, ["api.anthropic.com"]);
+        assert_eq!(config.dsf_image, None);
         assert_eq!(config.repos[0].approval, ApprovalPolicy::Label);
         assert!(config.allowlist.contains("OctoCat"));
         assert!(config.protected.is_protected(".github/workflows/ci.yml"));
@@ -597,6 +616,7 @@ mod tests {
             allow = ["https://pypi.org", "*.npmjs.org"]
             [images]
             worker = " "
+            dsf = ""
             [protect]
             extra = ["../outside"]
         "#;
@@ -614,6 +634,7 @@ mod tests {
                 "egress.allow",
                 "egress.allow",
                 "images.worker",
+                "images.dsf",
                 "protect.extra",
             ]
         );
