@@ -1,0 +1,52 @@
+# The built-in dsf workflow. A repo can replace it with its own
+# .factory/workflow.toml; see docs/design.md §4 for the rules.
+version = 1
+start = "plan"
+
+# Read-only: explore the repo and write a plan. `needs_decision` means the
+# spec is ambiguous and a human should answer first.
+[stages.plan]
+kind = "agent"
+mode = "read"
+prompt = "plan.md.j2"
+schema = "plan"
+on = { ready = "approve", needs_decision = "@blocked" }
+
+# Only waits when the repo policy is `always`, or the issue carries
+# factory:approve-plan; otherwise it passes straight through as `approved`.
+[stages.approve]
+kind = "gate"
+on = { approved = "implement", rejected = "@blocked" }
+
+[stages.implement]
+kind = "agent"
+mode = "write"
+prompt = "implement.md.j2"
+on = { success = "verify", failure = "@blocked" }
+
+# Always runs the .factory/ snapshot taken at the run's base commit.
+[stages.verify]
+kind = "command"
+run = ".factory/verify.sh"
+timeout = "30m"
+network = "none"
+max_visits = 5
+on = { success = "review", failure = "fix" }
+
+# Fresh context plus a host-built handoff: plan, diff stat, verify output tail.
+[stages.fix]
+kind = "agent"
+mode = "write"
+prompt = "fix.md.j2"
+max_visits = 3
+on = { success = "verify", failure = "@blocked" }
+
+# Fresh context, read-only. Advisory: a quality check, not a security control.
+[stages.review]
+kind = "agent"
+mode = "read"
+prompt = "review.md.j2"
+schema = "review"
+max_visits = 2
+on = { approve = "@publish", changes_requested = "fix" }
+exhausted = "@publish"

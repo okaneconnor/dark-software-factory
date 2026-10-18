@@ -1,0 +1,8 @@
+---
+source: crates/dsf/tests/cli.rs
+expression: "stderr.replace(&path.display().to_string(), \"config.toml\")"
+---
+error: config.toml: invalid config:
+  - `workers`: must be between 1 and 2
+  - `github.allowed_users`: list at least one GitHub login
+  - `repos`: configure at least one repo

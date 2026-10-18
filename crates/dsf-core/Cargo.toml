@@ -12,3 +12,10 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+jiff = { version = "0.2.38", default-features = false, features = ["std"] }
+serde = { version = "1.0.229", features = ["derive"] }
+thiserror = "2.0.21"
+toml = "1.1.8"
+
+[dev-dependencies]
+proptest = "1.12.0"
