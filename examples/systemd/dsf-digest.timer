@@ -1,0 +1,12 @@
+# Sends the digest at 07:00 local time. Persistent=true sends a missed one
+# when the host comes back up, so a night's work is never left unreported;
+# each digest covers everything since the last.
+[Unit]
+Description=Send the dsf digest every morning
+
+[Timer]
+OnCalendar=*-*-* 07:00:00 Europe/London
+Persistent=true
+
+[Install]
+WantedBy=timers.target

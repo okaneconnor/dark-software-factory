@@ -1,0 +1,23 @@
+# Checks the deployment with the same user and credentials as a tick:
+#   systemctl start dsf-doctor && journalctl -u dsf-doctor -n 30
+# It fails if any check fails, so a deploy can stop on it. Not enabled.
+[Unit]
+Description=dsf: check this host can run the factory
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=factory
+Group=factory
+ExecStart=/usr/local/bin/dsf doctor --config /etc/dsf/config.toml
+LoadCredential=claude-oauth-token:/etc/dsf/credentials/claude-oauth-token
+LoadCredential=github-app.pem:/etc/dsf/credentials/github-app.pem
+# Drop this line, as in dsf-digest.service, if there's no Teams webhook.
+LoadCredential=teams-webhook-url:/etc/dsf/credentials/teams-webhook-url
+TimeoutStartSec=5min
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=yes

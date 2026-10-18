@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::str::FromStr;
@@ -41,6 +42,23 @@ enum Command {
     },
     /// Let claiming start again after a pause.
     Unpause(StateArgs),
+    /// Send the morning digest: what finished since the last one, and what
+    /// is waiting. Posted to Teams when there's a webhook, otherwise printed.
+    Digest {
+        /// Print it without posting or recording it.
+        #[arg(long)]
+        dry_run: bool,
+        /// A file holding the Teams Workflows webhook URL. Defaults to
+        /// `$CREDENTIALS_DIRECTORY/teams-webhook-url`, then
+        /// `~/.config/dsf/teams-webhook-url`, if either exists.
+        #[arg(long, value_name = "FILE")]
+        webhook_file: Option<PathBuf>,
+        #[command(flatten)]
+        state: StateArgs,
+    },
+    /// Check this host can run the factory: the config, secrets, state
+    /// directory, GitHub App, repos and Docker. Changes nothing.
+    Doctor(Box<WorkerArgs>),
     /// Check and print workflow files.
     #[command(subcommand)]
     Workflow(WorkflowCommand),
@@ -235,6 +253,12 @@ fn main() -> ExitCode {
         Command::Status(state) => status(&state),
         Command::Pause { reason, state } => set_paused(&state, Some(&reason)),
         Command::Unpause(state) => set_paused(&state, None),
+        Command::Digest {
+            dry_run,
+            webhook_file,
+            state,
+        } => digest(&state, webhook_file.as_deref(), dry_run),
+        Command::Doctor(args) => doctor(&args),
         Command::Workflow(WorkflowCommand::Validate { file, config }) => {
             validate_workflow(&file, config.as_deref())
         }
@@ -550,6 +574,141 @@ fn set_paused(args: &StateArgs, reason: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+fn digest(args: &StateArgs, webhook_file: Option<&Path>, dry_run: bool) -> Result<()> {
+    use dsf::digest::Digest;
+
+    let (config, mut store) = open_state(args)?;
+    let tz = jiff::tz::TimeZone::get(&config.timezone)?;
+    let now = jiff::Timestamp::now();
+    let summary = Digest::load(&store, now)?.summarise(&config, &tz);
+    if dry_run {
+        print!("{}", summary.text());
+        return Ok(());
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let webhook_file = match webhook_file {
+        Some(file) => Some(file.to_owned()),
+        None => credential("teams-webhook-url", home.as_deref())
+            .ok()
+            .filter(|file| file.is_file()),
+    };
+    match webhook_file {
+        Some(file) => {
+            let url = dsf::digest::webhook_url(&read(&file)?)?;
+            let runtime = tokio::runtime::Runtime::new()?;
+            runtime.block_on(dsf::digest::post(&url, &summary.card()))?;
+            println!("posted the digest to Teams: {}", summary.title);
+        }
+        None => print!("{}", summary.text()),
+    }
+    Digest::sent(&mut store, now)
+}
+
+fn doctor(args: &WorkerArgs) -> Result<()> {
+    use dsf::doctor::{self, Check, Level};
+
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = home.as_deref();
+    let mut checks = Vec::new();
+    let config_file = config_path(args.github.config.as_deref(), home);
+    let config = match load_config(&config_file) {
+        Ok(config) => config,
+        Err(error) => {
+            checks.push(Check::new(Level::Fail, "config", format!("{error:#}")));
+            print!("{}", doctor::render(&checks));
+            bail!("the config is unusable");
+        }
+    };
+    let repos = config.repos.len();
+    checks.push(Check::new(
+        Level::Ok,
+        "config",
+        format!(
+            "{}: {repos} {}, {} {}, weekly usage cap {}%",
+            config_file.display(),
+            if repos == 1 { "repo" } else { "repos" },
+            config.workers,
+            if config.workers == 1 {
+                "worker"
+            } else {
+                "workers"
+            },
+            config.weekly_usage_cap,
+        ),
+    ));
+    let state = args
+        .state_dir
+        .clone()
+        .unwrap_or_else(|| config.state_dir.clone());
+    checks.push(doctor::state_dir(&state));
+
+    let token = match &args.token_file {
+        Some(file) => file.clone(),
+        None => credential("claude-oauth-token", home)?,
+    };
+    checks.push(doctor::secret_file("Claude token", &token, None));
+    let key = match &args.github.github_key {
+        Some(file) => file.clone(),
+        None => credential("github-app.pem", home)?,
+    };
+    let key_check = doctor::secret_file("GitHub App key", &key, None);
+    let key_ok = key_check.level == Level::Ok;
+    checks.push(key_check);
+    checks.push(doctor::webhook_file(&credential(
+        "teams-webhook-url",
+        home,
+    )?));
+
+    let worker_image = args
+        .image
+        .clone()
+        .unwrap_or_else(|| config.worker_image.clone());
+    let mut images = vec![("worker", worker_image.as_str())];
+    if args.egress == EgressArg::Proxy {
+        images.push(("proxy", args.dsf_image.as_str()));
+    }
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(async {
+        match (key_ok, config.github_app_id) {
+            (true, Some(app_id)) => {
+                match dsf::github::app::AppKey::load(app_id, &key)
+                    .and_then(|key| dsf::github::GitHub::new(key, &args.github.github_api))
+                {
+                    Ok(github) => checks.extend(doctor::github(&github, &config).await),
+                    Err(error) => {
+                        checks.push(Check::new(Level::Fail, "GitHub App", format!("{error:#}")));
+                    }
+                }
+            }
+            (_, None) => checks.push(Check::new(
+                Level::Fail,
+                "GitHub App",
+                "set github.app_id in the config",
+            )),
+            (false, Some(_)) => {}
+        }
+        match dsf::sandbox::Sandbox::connect() {
+            Ok(sandbox) => checks.extend(doctor::docker(&sandbox, &images).await),
+            Err(error) => checks.push(Check::new(Level::Fail, "Docker", format!("{error:#}"))),
+        }
+    });
+    let tz = jiff::tz::TimeZone::get(&config.timezone)?;
+    checks.push(Check::new(
+        Level::Note,
+        "window",
+        format!(
+            "{} ({}); dsf-tick.timer starts each tick",
+            dsf::status::window_text(&config, &tz, jiff::Timestamp::now()),
+            config.timezone
+        ),
+    ));
+    print!("{}", doctor::render(&checks));
+    match doctor::failures(&checks) {
+        0 => Ok(()),
+        n => bail!("{n} check(s) failed"),
+    }
+}
+
 /// The config and the run database, for commands that need no secrets.
 fn open_state(args: &StateArgs) -> Result<(Config, dsf::store::Store)> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
@@ -632,7 +791,12 @@ fn state_dir(
         (None, None, Some(home)) => home.join(".local/state/dsf"),
         (None, None, None) => bail!("set --state-dir or HOME"),
     };
-    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    // Private when dsf creates it; an existing directory is left alone.
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)
+        .with_context(|| format!("creating {}", dir.display()))?;
     Ok(dir.canonicalize()?)
 }
 

@@ -1,0 +1,19 @@
+# The morning digest, started by dsf-digest.timer (docs/design.md §7).
+[Unit]
+Description=dsf: the morning digest
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=factory
+Group=factory
+ExecStart=/usr/local/bin/dsf digest --config /etc/dsf/config.toml
+# The Teams Workflows webhook URL. Without this line the digest is printed
+# to the journal instead (`journalctl -u dsf-digest`).
+LoadCredential=teams-webhook-url:/etc/dsf/credentials/teams-webhook-url
+TimeoutStartSec=5min
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=yes

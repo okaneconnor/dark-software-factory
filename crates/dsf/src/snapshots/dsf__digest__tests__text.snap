@@ -1,0 +1,25 @@
+---
+source: crates/dsf/src/digest.rs
+expression: summary.text()
+---
+dsf: 2 draft PRs, 2 blocked, 1 awaiting approval
+Since Mon 19 Oct 07:00 (Europe/London)
+
+Draft PRs (2)
+  octo/calc#3  mean() of nothing: draft PR #10  https://github.com/octo/calc/pull/10
+  octo/calc#2  add() subtracts: draft PR #9  https://github.com/octo/calc/pull/9
+
+Blocked (2)
+  octo/calc#5  Docs: couldn't publish: the push was rejected  https://github.com/octo/calc/issues/5
+  octo/calc#4  Make it fast: the plan needs a decision: which inputs are slow?  https://github.com/octo/calc/issues/4
+
+Awaiting plan approval (1)
+  octo/calc#6  Rename calc  (run 6, plan posted Tue 20 Oct 05:00, expires Fri 23 Oct 05:00)
+
+Ready (1)
+  octo/calc#7  Support floats
+
+Usage:     no reading yet; cap 80% of the weekly allowance
+Claiming:  allowed
+Window:    23:00-07:00, closed until Tue 20 Oct 23:00
+Last tick: Tue 20 Oct 06:55
