@@ -2,3 +2,6 @@
 //! and the board. The rules that decide what happens live in `dsf-core`.
 
 pub mod hostgit;
+pub mod masker;
+pub mod rundir;
+pub mod store;
