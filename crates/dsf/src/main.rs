@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -23,6 +24,14 @@ enum Command {
     /// Check the configuration file.
     #[command(subcommand)]
     Config(ConfigCommand),
+    /// Run the egress proxy. dsf starts this in its proxy sidecar container.
+    Proxy {
+        #[arg(long, default_value = "0.0.0.0:3128")]
+        listen: SocketAddr,
+        /// A host name agents may reach over HTTPS. Repeat for each host.
+        #[arg(long = "allow", required = true, value_name = "HOST")]
+        allow: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -56,6 +65,7 @@ fn main() -> ExitCode {
             Ok(())
         }
         Command::Config(ConfigCommand::Validate { file }) => validate_config(&file),
+        Command::Proxy { listen, allow } => run_proxy(listen, &allow),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -119,6 +129,17 @@ fn load_config(file: &Path) -> Result<Config> {
         )
     })?;
     Ok(config)
+}
+
+fn run_proxy(listen: SocketAddr, allow: &[String]) -> Result<()> {
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(async {
+        let listener = tokio::net::TcpListener::bind(listen)
+            .await
+            .with_context(|| format!("listening on {listen}"))?;
+        println!("proxy listening on {listen}, allowing {}", allow.join(", "));
+        dsf::proxy::serve(listener, dsf::proxy::Policy::new(allow)).await
+    })
 }
 
 fn read(file: &Path) -> Result<String> {

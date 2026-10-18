@@ -30,8 +30,12 @@ jobs:
       # Installs exactly the toolchain and components in rust-toolchain.toml.
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      # The same gate the factory applies to its own pull requests.
+      # The same gate the factory applies to its own pull requests. The
+      # runner has Docker, so the container tests run here too; inside the
+      # factory's own verify container (no Docker) they skip.
       - run: .factory/verify.sh
+        env:
+          DSF_DOCKER_TESTS: "1"
 
   deny:
     name: cargo-deny
