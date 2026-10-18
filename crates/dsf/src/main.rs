@@ -407,6 +407,7 @@ async fn run_issue_async(args: &RunArgs) -> Result<Outcome> {
         egress,
         caps: Caps::default(),
         extra_protected: Vec::new(),
+        weekly_usage_cap: dsf_core::config::DEFAULT_WEEKLY_USAGE_CAP,
         claude_token: token,
     };
     let store = dsf::store::Store::open(&state_dir.join("dsf.sqlite"))?;
@@ -477,6 +478,7 @@ async fn github_factory(
         egress,
         caps: config.caps,
         extra_protected: config.protect_extra.clone(),
+        weekly_usage_cap: config.weekly_usage_cap,
         claude_token: token,
     };
     let store = dsf::store::Store::open(&state_dir.join("dsf.sqlite"))?;

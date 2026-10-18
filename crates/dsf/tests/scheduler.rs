@@ -1,8 +1,8 @@
 //! `dsf tick` scenarios against a fake GitHub, with the clock set by each
 //! test: the window, pausing and backoff, putting stale labels right,
 //! plans that expire, and (with Docker, `DSF_DOCKER_TESTS=1`) working
-//! through the queue, carrying on after a usage limit, and carrying on
-//! after a crash.
+//! through the queue, carrying on after a usage limit, stopping at the
+//! weekly usage cap, and carrying on after a crash.
 
 // Helpers outside #[test] functions aren't covered by clippy's
 // allow-unwrap-in-tests, and a failed precondition should panic here.
@@ -134,6 +134,53 @@ async fn a_pause_or_a_backoff_stops_claiming_until_it_is_lifted() {
     assert_eq!(
         tick("2026-10-20T01:03:00Z").tick().await.unwrap().notes,
         ["octo/calc#1: its author, mallory, isn't in github.allowed_users"]
+    );
+    assert_eq!(fake.writes().await, Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn over_the_usage_cap_claiming_waits_unless_the_cap_is_raised() {
+    let world = World::new("capped");
+    let fake = Fake::start().await;
+    // Untrusted, so a claim attempt shows up as a skip without Docker.
+    let issue = issue_json(1, "mallory", &["factory:ready"], FIX);
+    fake.issue(issue.clone(), json!([]), json!([])).await;
+    fake.listing("factory:ready", json!([issue])).await;
+    fake.listing("factory:running", json!([])).await;
+    let reading = json!({
+        "seen_at": "2026-10-19T22:10:00Z",
+        "usage": {
+            "status": "allowed",
+            "five_hour": null,
+            "seven_day": {"utilization": 0.85, "resets_at": "2026-10-22T09:00:00Z"}
+        }
+    });
+    world
+        .store()
+        .kv_set(dsf::usage::USAGE, &reading.to_string())
+        .unwrap();
+
+    let tick = |extra: &str, now: &str| scheduler(&world, &fake, extra, "fake", at(now));
+    assert_eq!(
+        tick("", NIGHT).tick().await.unwrap().notes,
+        [
+            "the weekly Claude allowance is 85% used, over the 80% cap, \
+             so nothing starts until Thu 22 Oct 10:02"
+        ]
+    );
+    let skipped = ["octo/calc#1: its author, mallory, isn't in github.allowed_users"];
+    assert_eq!(
+        tick("weekly_usage_cap = 90", NIGHT)
+            .tick()
+            .await
+            .unwrap()
+            .notes,
+        skipped
+    );
+    // After the weekly reset the old reading stops nothing.
+    assert_eq!(
+        tick("", "2026-10-22T22:30:00Z").tick().await.unwrap().notes,
+        skipped
     );
     assert_eq!(fake.writes().await, Vec::<String>::new());
 }
@@ -376,6 +423,115 @@ async fn after_a_usage_limit_claiming_waits_then_the_run_carries_on() {
             "review"
         ]
     );
+}
+
+#[tokio::test]
+async fn over_the_usage_cap_runs_pause_until_the_weekly_reset() {
+    if !enabled() {
+        return;
+    }
+    let world = World::new("cap");
+    let fake = Fake::start().await;
+    let first = ready_issue(&fake, 1, FIX).await;
+    let second = ready_issue(&fake, 2, FIX).await;
+    fake.listing("factory:ready", json!([first, second])).await;
+    fake.listing("factory:running", json!([])).await;
+    fake.writable().await;
+    let now = Timestamp::now();
+    // Whole seconds, as Claude reports it.
+    let reset = Timestamp::from_second(now.as_second() + 3 * 24 * 60 * 60).unwrap();
+    // Every agent stage reports 85% of the weekly allowance used.
+    let model = format!("weekly:85:{}", reset.as_second());
+
+    let record = scheduler(&world, &fake, ALWAYS_OPEN, &model, now)
+        .tick()
+        .await
+        .unwrap();
+    let why = "the weekly Claude allowance is 85% used, over the 80% cap";
+    assert_eq!(record.notes.len(), 2, "{:?}", record.notes);
+    assert_eq!(
+        record.notes[0],
+        format!("octo/calc#1: run 1 paused: {why} until it resets at {reset}")
+    );
+    assert!(
+        record.notes[1].starts_with(&format!("stopped claiming: {why}, so nothing starts until")),
+        "{:?}",
+        record.notes
+    );
+    // Planning reported the usage; implement never started.
+    // The cap holds the run, not a fixed time, so raising it takes effect.
+    let run = world.store().run(1).unwrap();
+    assert_eq!(run.suspend_reason, Some(SuspendReason::UsageLimit));
+    assert_eq!(run.resume_after, None);
+    assert_eq!(world.store().kv_get(BACKOFF_UNTIL).unwrap(), None);
+    assert_eq!(run.next_stage.as_deref(), Some("implement"));
+    let stages: Vec<String> = world
+        .store()
+        .attempts(1)
+        .unwrap()
+        .into_iter()
+        .map(|attempt| attempt.stage)
+        .collect();
+    assert_eq!(stages, ["plan", "approve"]);
+    assert_eq!(world.store().active_run("octo/calc", 2).unwrap(), None);
+    let comments: Vec<String> = fake
+        .requests()
+        .await
+        .into_iter()
+        .filter(|(method, path, _)| method == "POST" && path.ends_with("/issues/1/comments"))
+        .map(|(_, _, body)| body["body"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    assert!(
+        comments.iter().any(|comment| comment
+            == &format!(
+                "dsf paused this (run 1): {why} until it resets at {reset}. \
+                 It's back in the queue and continues from where it stopped."
+            )),
+        "{comments:?}"
+    );
+
+    // A day later it's still over the cap, so nothing changes.
+    let writes = fake.writes().await.len();
+    let tomorrow = now.checked_add(SignedDuration::from_hours(24)).unwrap();
+    let record = scheduler(&world, &fake, ALWAYS_OPEN, "fake", tomorrow)
+        .tick()
+        .await
+        .unwrap();
+    assert!(
+        record.notes[0].starts_with(&format!("{why}, so nothing starts until")),
+        "{:?}",
+        record.notes
+    );
+    assert_eq!(fake.writes().await.len(), writes);
+
+    // After the weekly reset the paused run carries on from implement.
+    // Only issue 1 is queued now, to keep the test short.
+    fake.server.reset().await;
+    fake.mount_app().await;
+    fake.writable().await;
+    let first = ready_issue(&fake, 1, FIX).await;
+    fake.listing("factory:ready", json!([first])).await;
+    fake.listing("factory:running", json!([])).await;
+    let after = reset.checked_add(SignedDuration::from_mins(3)).unwrap();
+    let record = scheduler(&world, &fake, ALWAYS_OPEN, "fake", after)
+        .tick()
+        .await
+        .unwrap();
+    assert_eq!(
+        record.notes.last().unwrap(),
+        &format!("octo/calc#1: run 1 opened {PR_URL}"),
+        "{:?}",
+        record.notes
+    );
+    assert!(world.published("calc.py").unwrap().contains("a + b"));
+    let stages: Vec<String> = world
+        .store()
+        .attempts(1)
+        .unwrap()
+        .into_iter()
+        .map(|attempt| attempt.stage)
+        .collect();
+    assert_eq!(stages, ["plan", "approve", "implement", "verify", "review"]);
 }
 
 #[tokio::test]

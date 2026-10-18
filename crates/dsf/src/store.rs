@@ -435,6 +435,34 @@ impl Store {
         Ok(())
     }
 
+    /// Suspends a run between stages, before `next_stage` starts. No
+    /// attempt is opened, and the visit `progress` counts for the stage
+    /// stands: the run resumes with that stage.
+    pub fn suspend_before(
+        &mut self,
+        run_id: i64,
+        next_stage: &str,
+        progress: &Progress,
+        reason: SuspendReason,
+        resume_after: Option<Timestamp>,
+        now: Timestamp,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE runs SET status = 'suspended', suspend_reason = ?2, resume_after = ?3,
+                             next_stage = ?4, progress = ?5, updated_at = ?6
+             WHERE id = ?1",
+            params![
+                run_id,
+                reason.as_str(),
+                resume_after.map(|t| t.to_string()),
+                next_stage,
+                serde_json::to_string(progress)?,
+                now.to_string()
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn set_plan(&mut self, run_id: i64, plan: &str, now: Timestamp) -> Result<()> {
         self.conn.execute(
             "UPDATE runs SET plan = ?2, updated_at = ?3 WHERE id = ?1",
@@ -943,6 +971,33 @@ mod tests {
             now(),
         );
         assert!(ended.is_err(), "running is not a final status");
+    }
+
+    #[test]
+    fn a_run_can_be_suspended_between_stages() {
+        let mut store = Store::open_in_memory().unwrap();
+        let run_id = store.create_run(&issue(1), now()).unwrap().unwrap();
+        let workflow = Workflow::builtin().unwrap();
+        let mut progress = Progress::default();
+        progress.begin(&workflow);
+        let resume: Timestamp = "2026-10-22T09:02:00Z".parse().unwrap();
+        store
+            .suspend_before(
+                run_id,
+                "plan",
+                &progress,
+                SuspendReason::UsageLimit,
+                Some(resume),
+                now(),
+            )
+            .unwrap();
+        let run = store.run(run_id).unwrap();
+        assert_eq!(run.status, RunStatus::Suspended);
+        assert_eq!(run.suspend_reason, Some(SuspendReason::UsageLimit));
+        assert_eq!(run.resume_after, Some(resume));
+        assert_eq!(run.next_stage.as_deref(), Some("plan"));
+        assert_eq!(run.progress.visits(&StageId::new("plan").unwrap()), 1);
+        assert_eq!(store.attempts(run_id).unwrap(), []);
     }
 
     #[test]

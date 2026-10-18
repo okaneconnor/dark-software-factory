@@ -80,6 +80,7 @@ impl World {
             egress: Egress::None,
             caps: Caps::default(),
             extra_protected: Vec::new(),
+            weekly_usage_cap: dsf_core::config::DEFAULT_WEEKLY_USAGE_CAP,
             claude_token: TOKEN.to_owned().into(),
         };
         let store = Store::open(&self.state.join("dsf.sqlite")).unwrap();

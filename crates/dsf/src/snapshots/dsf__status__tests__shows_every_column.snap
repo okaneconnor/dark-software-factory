@@ -4,6 +4,7 @@ expression: "board.render(&config(), &tz)"
 ---
 dsf at Mon 19 Oct 23:41 (Europe/London)
 Window:   23:00-07:00, open until Tue 20 Oct 07:00
+Usage:    weekly 62% (resets Thu 22 Oct 10:00), 5-hour 12% (resets Tue 20 Oct 00:00); cap 80%, read Mon 19 Oct 23:20
 Claiming: paused (run 4: Claude authentication failed); `dsf unpause` restarts it
 Last tick: Mon 19 Oct 23:40
 

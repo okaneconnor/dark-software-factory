@@ -1,5 +1,6 @@
-//! When the factory may claim work: the daily window, usage-limit backoff
-//! and worker capacity. Times are passed in, never read from a clock.
+//! When the factory may claim work: the daily window, usage-limit backoff,
+//! the weekly usage cap and worker capacity. Times are passed in, never
+//! read from a clock.
 
 use std::cmp::Ordering;
 
@@ -101,6 +102,21 @@ pub fn usage_limit_resume(
     }
 }
 
+/// While the weekly allowance is used to `cap` percent or more, when work
+/// may start again: just after the allowance resets. `None` under the cap,
+/// or once the reading's window has reset. A reading without a reset time
+/// can't say when it goes stale, so it never trips the cap; the real limit
+/// still stops the factory if it's reached.
+pub fn usage_cap_until(
+    utilization: f64,
+    resets_at: Option<Timestamp>,
+    cap: u8,
+    now: Timestamp,
+) -> Option<Timestamp> {
+    let reset = resets_at.filter(|reset| *reset > now)?;
+    (utilization * 100.0 >= f64::from(cap)).then(|| usage_limit_resume(now, Some(reset), 1))
+}
+
 fn add(timestamp: Timestamp, duration: SignedDuration) -> Timestamp {
     timestamp.checked_add(duration).unwrap_or(Timestamp::MAX)
 }
@@ -111,6 +127,8 @@ pub struct ClaimState {
     /// Set by the operator to stop all new work.
     pub paused: bool,
     pub backoff_until: Option<Timestamp>,
+    /// From [`usage_cap_until`].
+    pub usage_capped_until: Option<Timestamp>,
     /// Runs currently holding a worker slot.
     pub active_runs: usize,
 }
@@ -128,6 +146,7 @@ pub enum ClaimDecision {
 pub enum Wait {
     Paused,
     BackingOff { until: Timestamp },
+    OverUsageCap { until: Timestamp },
     WindowClosed { opens_at: Timestamp },
     AtCapacity,
 }
@@ -144,10 +163,16 @@ pub fn claim_decision(
     if state.paused {
         return ClaimDecision::Wait(Wait::Paused);
     }
-    if let Some(until) = state.backoff_until
-        && until > now
-    {
-        return ClaimDecision::Wait(Wait::BackingOff { until });
+    // Both can apply at once; the later one is the real wait.
+    let backoff = state.backoff_until.filter(|until| *until > now);
+    let capped = state.usage_capped_until.filter(|until| *until > now);
+    match (backoff, capped) {
+        (Some(backoff), Some(capped)) if backoff > capped => {
+            return ClaimDecision::Wait(Wait::BackingOff { until: backoff });
+        }
+        (_, Some(until)) => return ClaimDecision::Wait(Wait::OverUsageCap { until }),
+        (Some(until), None) => return ClaimDecision::Wait(Wait::BackingOff { until }),
+        (None, None) => {}
     }
     if !window.is_open(now, tz) {
         return ClaimDecision::Wait(Wait::WindowClosed {
@@ -305,6 +330,7 @@ mod tests {
         let idle = ClaimState {
             paused: false,
             backoff_until: None,
+            usage_capped_until: None,
             active_runs: 0,
         };
 
@@ -363,5 +389,56 @@ mod tests {
                 opens_at: at("2026-12-01T23:00:00Z")
             })
         );
+    }
+
+    #[test]
+    fn the_cap_and_a_backoff_report_whichever_ends_later() {
+        let tz = london();
+        let night = at("2026-12-01T23:30:00Z");
+        let sooner = at("2026-12-02T01:00:00Z");
+        let later = at("2026-12-04T09:02:00Z");
+        let state = |backoff, capped| ClaimState {
+            paused: false,
+            backoff_until: backoff,
+            usage_capped_until: capped,
+            active_runs: 0,
+        };
+        let decide = |state: &ClaimState| claim_decision(night, &tz, &overnight(), 1, state);
+        assert_eq!(
+            decide(&state(None, Some(later))),
+            ClaimDecision::Wait(Wait::OverUsageCap { until: later })
+        );
+        assert_eq!(
+            decide(&state(Some(sooner), Some(later))),
+            ClaimDecision::Wait(Wait::OverUsageCap { until: later })
+        );
+        assert_eq!(
+            decide(&state(Some(later), Some(later))),
+            ClaimDecision::Wait(Wait::OverUsageCap { until: later })
+        );
+        assert_eq!(
+            decide(&state(Some(later), Some(sooner))),
+            ClaimDecision::Wait(Wait::BackingOff { until: later })
+        );
+        assert_eq!(
+            decide(&state(None, Some(at("2026-12-01T23:00:00Z")))),
+            ClaimDecision::Claim { slots: 1 }
+        );
+    }
+
+    #[test]
+    fn the_usage_cap_holds_until_the_weekly_allowance_resets() {
+        let now = at("2026-12-01T23:30:00Z");
+        let reset = at("2026-12-04T09:00:00Z");
+        let resumes = Some(at("2026-12-04T09:02:00Z"));
+        assert_eq!(usage_cap_until(0.85, Some(reset), 80, now), resumes);
+        assert_eq!(usage_cap_until(0.80, Some(reset), 80, now), resumes);
+        assert_eq!(usage_cap_until(0.79, Some(reset), 80, now), None);
+        // 100 leaves it to the real limit.
+        assert_eq!(usage_cap_until(0.99, Some(reset), 100, now), None);
+        assert_eq!(usage_cap_until(1.0, Some(reset), 100, now), resumes);
+        // Once the window resets, the reading says nothing about the new one.
+        assert_eq!(usage_cap_until(0.95, Some(reset), 80, reset), None);
+        assert_eq!(usage_cap_until(0.95, None, 80, now), None);
     }
 }

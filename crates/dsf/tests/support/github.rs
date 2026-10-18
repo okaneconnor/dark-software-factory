@@ -299,6 +299,7 @@ impl World {
             egress: Egress::None,
             caps: dsf_core::clamp::Caps::default(),
             extra_protected: Vec::new(),
+            weekly_usage_cap: config.weekly_usage_cap,
             claude_token: TOKEN.to_owned().into(),
         };
         let github = fake.github();
