@@ -31,7 +31,6 @@ pub struct Config {
     /// read the tz database.
     pub timezone: String,
     pub workers: usize,
-    pub poll_interval: Duration,
     pub window: Window,
     pub digest_at: Time,
     /// How long a plan waits for approval before the run is blocked.
@@ -135,7 +134,6 @@ impl Config {
 struct RawConfig {
     timezone: String,
     workers: Option<usize>,
-    poll_interval: Option<String>,
     digest_at: Option<String>,
     approval_expiry: Option<String>,
     state_dir: Option<PathBuf>,
@@ -294,12 +292,6 @@ impl RawConfig {
         }
 
         let workers = check.number("workers", self.workers, 1, (1, MAX_WORKERS));
-        let poll_interval = check.duration(
-            "poll_interval",
-            self.poll_interval.as_deref(),
-            5 * MINUTE,
-            (MINUTE, HOUR),
-        );
         let digest_at = match self.digest_at.as_deref() {
             Some(text) => check.time("digest_at", text),
             None => jiff::civil::time(7, 0, 0, 0),
@@ -424,7 +416,6 @@ impl RawConfig {
         Ok(Config {
             timezone,
             workers,
-            poll_interval,
             window,
             digest_at,
             approval_expiry,
@@ -517,7 +508,6 @@ mod tests {
     fn minimal_config_gets_the_agreed_defaults() {
         let config = Config::parse(MINIMAL).unwrap();
         assert_eq!(config.workers, 1);
-        assert_eq!(config.poll_interval, 5 * MINUTE);
         assert_eq!(config.digest_at, jiff::civil::time(7, 0, 0, 0));
         assert_eq!(config.window.start, jiff::civil::time(23, 0, 0, 0));
         assert_eq!(config.window.end, jiff::civil::time(7, 0, 0, 0));
@@ -568,7 +558,6 @@ mod tests {
     fn reports_every_problem_at_once() {
         let toml = r#"
             timezone = ""
-            poll_interval = "10s"
             digest_at = "7am"
             state_dir = "relative/dir"
             window = { start = "23:00", end = "25:00" }
@@ -593,7 +582,6 @@ mod tests {
             fields(toml),
             [
                 "timezone",
-                "poll_interval",
                 "digest_at",
                 "state_dir",
                 "window.end",

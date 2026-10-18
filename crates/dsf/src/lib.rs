@@ -11,4 +11,6 @@ pub mod prompts;
 pub mod proxy;
 pub mod rundir;
 pub mod sandbox;
+pub mod scheduler;
+pub mod status;
 pub mod store;

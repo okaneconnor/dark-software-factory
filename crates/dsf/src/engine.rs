@@ -45,6 +45,10 @@ use crate::store::{self, Advance, Attempt, AttemptEnd, NewRun, RunStatus, Store,
 /// needs publishing.
 const PUBLISH: &str = "@publish";
 
+/// Usage-limit hits in a row with no completed agent stage between them,
+/// which lengthen the backoff when the reset time isn't known.
+const LIMIT_HITS: &str = "usage_limit_hits";
+
 /// How agent containers reach the internet.
 #[derive(Debug, Clone)]
 pub enum Egress {
@@ -334,9 +338,46 @@ impl Engine {
         Ok(())
     }
 
+    /// Puts things right after dsf stopped without finishing, e.g. a crash
+    /// or a reboot. Every attempt left running is marked interrupted and its
+    /// run suspended, to continue from its last checkpoint, and the run's
+    /// containers are removed so an orphaned agent can't carry on unseen.
+    /// A run that stopped before its first stage has nothing to continue
+    /// and is canceled. Returns the interrupted runs.
+    ///
+    /// Only safe while no run is in progress, i.e. under the state lock.
+    pub async fn recover(&self) -> Result<Vec<i64>> {
+        let unfinished = self.db()?.unfinished_runs()?;
+        for run in unfinished.iter().filter(|r| r.status == RunStatus::Queued) {
+            self.cancel(run.id, "dsf stopped before the run's first stage")?;
+        }
+        self.db()?.interrupt_unfinished(None, Timestamp::now())?;
+        let mut interrupted = Vec::new();
+        for run in unfinished.iter().filter(|r| r.status == RunStatus::Running) {
+            let removed = self
+                .sandbox
+                .remove_labelled(&format!("{RUN_LABEL}={}", self.run_label(run.id)))
+                .await?;
+            let stage = run.next_stage.as_deref().unwrap_or("setup");
+            let mut message =
+                format!("dsf stopped during {stage}; the run continues from its last checkpoint");
+            if removed > 0 {
+                let _ = write!(message, " (removed {removed} leftover container(s))");
+            }
+            self.event(run.id, "interrupted", &message);
+            interrupted.push(run.id);
+        }
+        Ok(interrupted)
+    }
+
     /// The issue's unfinished run, if any.
     pub fn active_run(&self, repo: &str, issue: u64) -> Result<Option<store::Run>> {
         self.db()?.active_run(repo, issue)
+    }
+
+    /// The run state, for the scheduler and `dsf status`.
+    pub fn store(&self) -> Result<MutexGuard<'_, Store>> {
+        self.db()
     }
 
     pub fn stored_run(&self, run_id: i64) -> Result<store::Run> {
@@ -380,7 +421,8 @@ impl Engine {
                 &format!("removed {removed} leftover container(s)"),
             );
         }
-        self.db()?.interrupt_unfinished(Timestamp::now())?;
+        self.db()?
+            .interrupt_unfinished(Some(run_id), Timestamp::now())?;
         let stored = self.db()?.run(run_id)?;
         if !matches!(stored.status, RunStatus::Suspended | RunStatus::Queued) {
             bail!(
@@ -832,6 +874,7 @@ impl Engine {
 
         match outcome {
             AgentOutcome::Completed(completion) => {
+                self.db()?.kv_delete(LIMIT_HITS)?;
                 if mode == AgentMode::Write
                     && let Some(reason) = self.record_work(run, stage, visit).await?
                 {
@@ -841,9 +884,19 @@ impl Engine {
             }
             AgentOutcome::Limited { resets_at, detail } => {
                 run.repo.reset_to(&run.checkpoint).await?;
+                let hits = {
+                    let mut db = self.db()?;
+                    let hits = db
+                        .kv_get(LIMIT_HITS)?
+                        .and_then(|n| n.parse::<u32>().ok())
+                        .unwrap_or(0)
+                        .saturating_add(1);
+                    db.kv_set(LIMIT_HITS, &hits.to_string())?;
+                    hits
+                };
                 Ok(StageResult::Suspend {
                     reason: SuspendReason::UsageLimit,
-                    resume_after: Some(usage_limit_resume(Timestamp::now(), resets_at, 1)),
+                    resume_after: Some(usage_limit_resume(Timestamp::now(), resets_at, hits)),
                     detail,
                 })
             }
@@ -1216,7 +1269,8 @@ impl Engine {
         Ok(self.masker.mask(&body))
     }
 
-    fn block(&self, run_id: i64, reason: &str) -> Result<RunEnd> {
+    /// Ends a run as blocked, e.g. when its plan was never approved.
+    pub fn block(&self, run_id: i64, reason: &str) -> Result<RunEnd> {
         let reason = self.masker.mask(reason);
         self.db()?
             .end_run(run_id, RunStatus::Blocked, &reason, Timestamp::now())?;

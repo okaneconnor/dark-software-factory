@@ -216,6 +216,8 @@ pub struct Run {
     pub require_approval: bool,
     /// The comment that posted the plan for approval.
     pub approval_comment_id: Option<u64>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -351,6 +353,46 @@ impl Store {
             .optional()?
             .map(RunRow::parse)
             .transpose()
+    }
+
+    /// The issue's most recent run, finished or not.
+    pub fn latest_run(&self, repo: &str, issue: u64) -> Result<Option<Run>> {
+        self.conn
+            .query_row(
+                "SELECT * FROM runs WHERE repo = ?1 AND issue = ?2 ORDER BY id DESC LIMIT 1",
+                params![repo, i64::try_from(issue)?],
+                RunRow::read,
+            )
+            .optional()?
+            .map(RunRow::parse)
+            .transpose()
+    }
+
+    /// Every run that hasn't finished, oldest first.
+    pub fn unfinished_runs(&self) -> Result<Vec<Run>> {
+        self.runs(
+            "SELECT * FROM runs WHERE status IN ('queued', 'running', 'suspended') ORDER BY id",
+            [],
+        )
+    }
+
+    /// Runs that finished at or after `since`, most recent first.
+    pub fn finished_since(&self, since: Timestamp) -> Result<Vec<Run>> {
+        self.runs(
+            "SELECT * FROM runs
+             WHERE status IN ('published', 'blocked', 'publish_failed', 'canceled')
+               AND updated_at >= ?1
+             ORDER BY updated_at DESC, id DESC",
+            [since.to_string()],
+        )
+    }
+
+    fn runs(&self, sql: &str, params: impl rusqlite::Params) -> Result<Vec<Run>> {
+        let mut query = self.conn.prepare(sql)?;
+        let rows = query
+            .query_map(params, RunRow::read)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter().map(RunRow::parse).collect()
     }
 
     pub fn set_approval_comment(
@@ -533,18 +575,24 @@ impl Store {
         Ok(())
     }
 
-    /// At startup: marks every attempt left running as interrupted and
+    /// After a crash: marks every attempt left running as interrupted and
     /// suspends its run, returning them so their containers can be removed.
-    pub fn interrupt_unfinished(&mut self, now: Timestamp) -> Result<Vec<Interrupted>> {
+    /// `run` limits this to one run, so resuming it can't disturb another
+    /// that is genuinely in progress.
+    pub fn interrupt_unfinished(
+        &mut self,
+        run: Option<i64>,
+        now: Timestamp,
+    ) -> Result<Vec<Interrupted>> {
         let now = now.to_string();
         let tx = self.conn.transaction()?;
         let interrupted = {
             let mut query = tx.prepare(
                 "SELECT run_id, id, stage, container_id FROM stage_attempts
-                 WHERE status = 'running' ORDER BY id",
+                 WHERE status = 'running' AND (?1 IS NULL OR run_id = ?1) ORDER BY id",
             )?;
             query
-                .query_map([], |row| {
+                .query_map([run], |row| {
                     Ok(Interrupted {
                         run_id: row.get(0)?,
                         attempt_id: row.get(1)?,
@@ -555,13 +603,14 @@ impl Store {
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
         tx.execute(
-            "UPDATE stage_attempts SET status = 'interrupted', finished_at = ?1 WHERE status = 'running'",
-            [&now],
+            "UPDATE stage_attempts SET status = 'interrupted', finished_at = ?1
+             WHERE status = 'running' AND (?2 IS NULL OR run_id = ?2)",
+            params![now, run],
         )?;
         tx.execute(
             "UPDATE runs SET status = 'suspended', suspend_reason = 'interrupted', updated_at = ?1
-             WHERE status = 'running'",
-            [&now],
+             WHERE status = 'running' AND (?2 IS NULL OR id = ?2)",
+            params![now, run],
         )?;
         tx.commit()?;
         Ok(interrupted)
@@ -634,6 +683,11 @@ impl Store {
         )?;
         Ok(())
     }
+
+    pub fn kv_delete(&mut self, key: &str) -> Result<()> {
+        self.conn.execute("DELETE FROM kv WHERE key = ?1", [key])?;
+        Ok(())
+    }
 }
 
 /// A `runs` row as stored, before parsing its text columns.
@@ -660,6 +714,8 @@ struct RunRow {
     issue_comments: String,
     require_approval: bool,
     approval_comment_id: Option<i64>,
+    created_at: String,
+    updated_at: String,
 }
 
 impl RunRow {
@@ -687,6 +743,8 @@ impl RunRow {
             issue_comments: row.get("issue_comments")?,
             require_approval: row.get("require_approval")?,
             approval_comment_id: row.get("approval_comment_id")?,
+            created_at: row.get("created_at")?,
+            updated_at: row.get("updated_at")?,
         })
     }
 
@@ -714,6 +772,8 @@ impl RunRow {
             issue_comments: self.issue_comments,
             require_approval: self.require_approval,
             approval_comment_id: self.approval_comment_id.map(u64::try_from).transpose()?,
+            created_at: self.created_at.parse()?,
+            updated_at: self.updated_at.parse()?,
         })
     }
 }
@@ -894,7 +954,7 @@ mod tests {
             .unwrap();
         store.set_container(attempt, "dead").unwrap();
 
-        let interrupted = store.interrupt_unfinished(now()).unwrap();
+        let interrupted = store.interrupt_unfinished(None, now()).unwrap();
         assert_eq!(
             interrupted,
             [Interrupted {
@@ -909,9 +969,49 @@ mod tests {
         assert_eq!(run.suspend_reason, Some(SuspendReason::Interrupted));
         assert_eq!(store.attempts(run_id).unwrap()[0].status, "interrupted");
         assert_eq!(
-            store.interrupt_unfinished(now()).unwrap(),
+            store.interrupt_unfinished(None, now()).unwrap(),
             Vec::<Interrupted>::new()
         );
+    }
+
+    #[test]
+    fn interrupting_one_run_leaves_the_others_running() {
+        let mut store = Store::open_in_memory().unwrap();
+        let first = store.create_run(&issue(1), now()).unwrap().unwrap();
+        let second = store.create_run(&issue(2), now()).unwrap().unwrap();
+        store.start_attempt(first, "plan", 1, None, now()).unwrap();
+        store.start_attempt(second, "plan", 1, None, now()).unwrap();
+
+        let interrupted = store.interrupt_unfinished(Some(first), now()).unwrap();
+        assert_eq!(interrupted.len(), 1);
+        assert_eq!(interrupted[0].run_id, first);
+        assert_eq!(store.run(first).unwrap().status, RunStatus::Suspended);
+        assert_eq!(store.run(second).unwrap().status, RunStatus::Running);
+        assert_eq!(store.attempts(second).unwrap()[0].status, "running");
+    }
+
+    #[test]
+    fn lists_unfinished_and_recently_finished_runs() {
+        let mut store = Store::open_in_memory().unwrap();
+        let old = store.create_run(&issue(1), now()).unwrap().unwrap();
+        let earlier: Timestamp = "2026-10-10T00:00:00Z".parse().unwrap();
+        store
+            .end_run(old, RunStatus::Published, "published", earlier)
+            .unwrap();
+        let recent = store.create_run(&issue(1), now()).unwrap().unwrap();
+        store
+            .end_run(recent, RunStatus::Blocked, "needs a decision", now())
+            .unwrap();
+        let open = store.create_run(&issue(2), now()).unwrap().unwrap();
+
+        let ids = |runs: Vec<Run>| runs.into_iter().map(|run| run.id).collect::<Vec<_>>();
+        assert_eq!(ids(store.unfinished_runs().unwrap()), [open]);
+        let since: Timestamp = "2026-10-17T00:00:00Z".parse().unwrap();
+        assert_eq!(ids(store.finished_since(since).unwrap()), [recent]);
+        assert_eq!(ids(store.finished_since(earlier).unwrap()), [recent, old]);
+        let latest = store.latest_run("octocat/hello", 1).unwrap().unwrap();
+        assert_eq!((latest.id, latest.updated_at), (recent, now()));
+        assert_eq!(store.latest_run("octocat/hello", 3).unwrap(), None);
     }
 
     #[test]
@@ -929,6 +1029,9 @@ mod tests {
         store.kv_set("paused", "true").unwrap();
         store.kv_set("paused", "false").unwrap();
         assert_eq!(store.kv_get("paused").unwrap().as_deref(), Some("false"));
+        store.kv_delete("paused").unwrap();
+        store.kv_delete("paused").unwrap();
+        assert_eq!(store.kv_get("paused").unwrap(), None);
     }
 
     #[test]

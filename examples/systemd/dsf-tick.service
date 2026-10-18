@@ -1,0 +1,26 @@
+# One pass of dsf, started by dsf-tick.timer (docs/design.md §3).
+# These units are an example: the hardening below is checked on a real VM
+# at the first deployment.
+[Unit]
+Description=dsf: one pass of the dark software factory
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=factory
+Group=factory
+ExecStart=/usr/local/bin/dsf tick --config /etc/dsf/config.toml
+# Secrets reach dsf as systemd credentials, read from $CREDENTIALS_DIRECTORY,
+# so they are never in the environment or readable by other services.
+LoadCredential=claude-oauth-token:/etc/dsf/credentials/claude-oauth-token
+LoadCredential=github-app.pem:/etc/dsf/credentials/github-app.pem
+# A tick works until its queue is empty or the window closes. This is a
+# backstop; the timer starts no new tick while one is running.
+TimeoutStartSec=12h
+# Stopping dsf mid-run is safe: the next tick recovers the interrupted run.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=yes
