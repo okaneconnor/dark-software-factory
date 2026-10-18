@@ -38,7 +38,8 @@ CLI commands for operators and development:
 | Command | Purpose |
 |---|---|
 | `dsf run owner/repo#N` | Run one issue in the foreground |
-| `dsf run --local <repo> --issue-file <file>` | Run against a local repo with no GitHub, for development and tests |
+| `dsf run --local <repo> --issue-file <file>` | Run against a local repo with no GitHub, for development and tests. The result is pushed to `factory/issue-<n>` in that repo, or `--publish-to`. Exit codes: 0 published, 2 blocked, 3 suspended, 4 publish failed. |
+| `dsf run --resume <run> [--approve]` | Resume a suspended or interrupted run; `--approve` passes a waiting plan gate |
 | `dsf doctor` | Preflight: Docker, tokens, image, config, labels |
 | `dsf workflow validate <file> [--config <file>]` | Validate a workflow file, applying the operator's caps when a config is given |
 | `dsf workflow default` | Print the built-in workflow, a starting point for a repo's own |
@@ -136,9 +137,9 @@ State lives in SQLite as plain rows, updated in one transaction at each stage bo
 
 A run moves `queued → running → suspended{approval | usage_limit | interrupted} → queued → …`. It ends in one of `published`, `blocked`, `publish_failed` or `canceled`.
 
-Resuming a run always resets the worktree to `checkpoint_sha`, cleans it, and executes `next_stage`.
+Resuming a run always removes any container still labelled with the run, then resets the worktree to `checkpoint_sha`, cleans it, and executes `next_stage`. The order matters: an orphaned agent must not keep writing into a worktree that has just been reset.
 
-- **Crash or restart.** On startup, containers labelled with an unfinished attempt are removed and the attempt is marked `interrupted`; the stage then re-runs. An interruption does not consume a visit, but two in a row block the run.
+- **Crash or restart.** On startup, containers labelled with an unfinished attempt are removed and the attempt is marked `interrupted`; the stage then re-runs. An interruption does not consume a visit, but two in a row block the run. The interruption count is saved before the stage re-runs, so repeated crashes are counted. A test kills `dsf run` with SIGKILL mid-stage and resumes it to completion.
 - **Usage limit.** Detected from the stream (spike S4): a `rate_limit_event` whose status is `rejected`, or an API error of kind `usage_limit_reached`, both carrying the reset time. The run is suspended and the issue relabelled `factory:ready`, with claiming paused until the limit resets: two minutes after the reported reset time, capped at eight days because weekly limits can be days away. Without a reset time the pause is 30 minutes, doubling with each consecutive hit up to 4 hours. On the next claim the suspended run resumes if the issue is unchanged since its snapshot; otherwise a fresh run supersedes it.
 - **Approval gate.** The plan is posted as an issue comment carrying a `dsf:run=<id>` marker, and the issue is labelled `factory:awaiting-approval`. The run continues only when `factory:plan-approved` is added *after* that comment, by an allowlisted user. Rejection is a human relabelling `factory:ready` after editing the spec, which produces a fresh run. An unanswered gate expires to `@blocked` after a configurable number of days. Silence never approves.
 
@@ -219,8 +220,9 @@ The controls below are what make dsf safe to leave running unattended. [`CLAUDE.
 ```
 crates/dsf-core/      pure domain model (no IO, enforced in CI)
 crates/dsf/           the binary: cli, serve, github, hostgit, sandbox, agent, proxy, store, scheduler, digest, web
-crates/fake-claude/   test-only: deterministic stream-json emitter driven by scenario files
 defaults/             default workflow and prompt templates (embedded)
+crates/dsf/tests/fake-agent/  test-only: a shell `claude` that acts on `fake-<stage>:` lines in the
+                      issue and prints stream-json, in a small Alpine image
 worker/Dockerfile     agent and verify image: Node, pinned Claude Code, git, make, Python
 docker/dsf.Dockerfile dsf itself, used for the proxy sidecar
 examples/             config and target-repo .factory/ examples
