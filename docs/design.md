@@ -1,6 +1,6 @@
 # dsf design
 
-> **Status:** agreed design, pre-implementation (October 2026). Anything marked *open* is answered by a spike (see [Open questions](#open-questions-spikes)) before the code that depends on it is written. When reality disagrees with this document, change the document in the same PR.
+> **Status:** agreed design (October 2026). The spikes that tested its assumptions are recorded in [Spike findings](#spike-findings). When reality disagrees with this document, change the document in the same PR.
 
 ## 1. Purpose
 
@@ -29,7 +29,7 @@ One binary, `dsf`. In production it runs as `dsf serve`, a systemd service owned
 
 - **Scheduler.** Polls GitHub on an interval, applies the window, worker limit and backoff, and claims issues.
 - **Run tasks.** One tokio task per active run, executing its workflow stage by stage.
-- **Egress proxy.** The agent containers' only route to the internet (§6).
+- **Egress proxy.** The agent containers' only route to the internet (§6). It runs as a sidecar container from the dsf binary itself, attached to both Docker's default bridge and the agents' internal network, so agent traffic stays on Docker networks and never meets the host's firewall.
 - **Board.** Read-only HTML on `127.0.0.1`, exposed by the operator if wanted (e.g. `tailscale serve`).
 - **Digest.** The morning summary.
 
@@ -52,7 +52,7 @@ A workflow is a small graph of **stages**. Each stage has a kind and routes on i
 
 | Kind | Does | Outcome labels |
 |---|---|---|
-| `agent` | Runs Claude Code. `mode = "read"` uses `--restricted --tools Read,Grep,Glob` over a read-only worktree; `mode = "write"` allows edits. A `schema` makes Claude return structured output via `--json-schema`, whose `outcome` field becomes the label. | `success` / `failure`, or the schema's labels |
+| `agent` | Runs Claude Code (invocation in §6.4). `mode = "read"` gives it only Read, Grep and Glob over a read-only worktree; `mode = "write"` adds Edit, Write and Bash. A `schema` makes Claude return structured output via `--json-schema`, whose `outcome` field becomes the label. | `success` / `failure`, or the schema's labels |
 | `command` | Runs a command, e.g. `.factory/verify.sh`, in a container with no credentials | `success` / `failure` |
 | `gate` | Waits for a human decision on the issue (§5) | `approved` / `rejected` |
 
@@ -139,7 +139,7 @@ A run moves `queued → running → suspended{approval | usage_limit | interrupt
 Resuming a run always resets the worktree to `checkpoint_sha`, cleans it, and executes `next_stage`.
 
 - **Crash or restart.** On startup, containers labelled with an unfinished attempt are removed and the attempt is marked `interrupted`; the stage then re-runs. An interruption does not consume a visit, but two in a row block the run.
-- **Usage limit.** The run is suspended and the issue relabelled `factory:ready`, with claiming paused until the limit resets: two minutes after the reported reset time, capped at eight days because weekly limits can be days away. Without a reset time the pause is 30 minutes, doubling with each consecutive hit up to 4 hours. On the next claim the suspended run resumes if the issue is unchanged since its snapshot; otherwise a fresh run supersedes it.
+- **Usage limit.** Detected from the stream (spike S4): a `rate_limit_event` whose status is `rejected`, or an API error of kind `usage_limit_reached`, both carrying the reset time. The run is suspended and the issue relabelled `factory:ready`, with claiming paused until the limit resets: two minutes after the reported reset time, capped at eight days because weekly limits can be days away. Without a reset time the pause is 30 minutes, doubling with each consecutive hit up to 4 hours. On the next claim the suspended run resumes if the issue is unchanged since its snapshot; otherwise a fresh run supersedes it.
 - **Approval gate.** The plan is posted as an issue comment carrying a `dsf:run=<id>` marker, and the issue is labelled `factory:awaiting-approval`. The run continues only when `factory:plan-approved` is added *after* that comment, by an allowlisted user. Rejection is a human relabelling `factory:ready` after editing the spec, which produces a fresh run. An unanswered gate expires to `@blocked` after a configurable number of days. Silence never approves.
 
 A unique index on `(repo, issue)` over non-terminal runs prevents double claims. Resumed runs still respect the window.
@@ -170,11 +170,12 @@ The controls below are what make dsf safe to leave running unattended. [`CLAUDE.
 3. **Protected paths.** After **every** agent stage, the change since `base_sha` is checked against `.factory/`, `.github/`, `.claude/`, `.mcp.json` and any operator additions. An entry covers the path itself and everything beneath it, ignoring ASCII case. A violation is deterministic and blocks the run immediately. The `.factory/` snapshot that command stages run is extracted from git objects at `base_sha`, and a snapshot containing a symlink is refused: one could point at a file the agent is free to edit.
 4. **Hardened containers.**
    - Settings: non-root user, `cap-drop ALL`, `no-new-privileges`, a read-only root filesystem with tmpfs `/tmp` and `HOME`, PID, memory and CPU limits, and no Docker socket.
-   - Environment: cleared, with an allowlist. Only `CLAUDE_CODE_OAUTH_TOKEN` and proxy settings reach agent containers, and verify containers receive no secrets.
+   - Environment: cleared, with an allowlist. Agent containers get `CLAUDE_CODE_OAUTH_TOKEN`, the proxy settings, `HOME`, `DISABLE_AUTOUPDATER=1` and `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`; verify containers receive no secrets.
    - Labels: `dsf.run` and `dsf.attempt`, used for reconciliation and cleanup.
+   - Invocation (spike S1): every agent stage runs `claude -p --restricted --strict-mcp-config --no-session-persistence --output-format stream-json --verbose` with an explicit `--tools` list and `--model`. `--restricted` ignores the repo's and user's settings files, so a repo's `.claude/settings.json` hooks never run; it also refuses `bypassPermissions`, confines file tools to the working directory, and blocks writes to git and settings files. Read stages get `--tools Read,Grep,Glob`. Write stages get `--tools Read,Grep,Glob,Edit,Write,Bash --permission-mode acceptEdits --allowedTools Bash`. Without `--tools`, the CLI's default set includes web, scheduling and remote-trigger tools.
    - Claude Code is never run with `--bare`, which ignores OAuth.
 5. **Egress.**
-   - Agent containers sit on an internal Docker network whose only exit is dsf's allowlisting CONNECT proxy (`HTTPS_PROXY`). The default allowlist is the Anthropic endpoints plus the operator's package registries.
+   - Agent containers sit on an internal Docker network whose only exit is dsf's allowlisting CONNECT proxy (`HTTPS_PROXY`). The internal network has no DNS of its own, so the proxy also does all name resolution. The allowlist is `api.anthropic.com`, which spike S3 showed is all Claude Code needs, plus the operator's package registries.
    - Verify has no network by default; a repo may opt in to the proxy.
    - DNS filtering on the host is a useful second layer, not a substitute.
 6. **Secret hygiene.**
@@ -259,16 +260,52 @@ docs/                 this document and operations notes
 | Repo-defined hooks or MCP servers executed on the host | Host code execution from repo-controlled files |
 | Auto-merge | Draft PRs only |
 
-## Open questions (spikes)
+## Spike findings
 
-| # | Question | Status |
+The four open questions were answered on 2026-10-18 with Claude Code 2.1.292 in the hardened container shape above. Sanitised captures are in [`crates/dsf/tests/fixtures/stream-json/`](../crates/dsf/tests/fixtures/stream-json/).
+
+| # | Question | Answer |
 |---|---|---|
-| S1 | Does Claude Code authenticate with `CLAUDE_CODE_OAUTH_TOKEN` in the hardened container (read-only root, tmpfs `HOME`, non-root)? What exactly do `--json-schema` and `--restricted -p` emit in stream-json? | open |
-| S2 | With `.git` mounted read-only, does Claude Code still get useful git context (`status`, `log`, `diff`)? Do host-side commits from the separate git directory work as designed? | open |
-| S3 | Does Claude Code work through an internal Docker network plus a CONNECT proxy? Should the proxy be a sidecar container or bound on the host, and how does that interact with a host firewall (UFW)? | open |
-| S4 | What does a subscription usage-limit error look like in stream-json and on stderr, and does it carry a reset time? | open |
+| S1 | Does Claude Code authenticate with `CLAUDE_CODE_OAUTH_TOKEN` in the hardened container, and what do `--json-schema` and `--restricted -p` emit? | **Yes.** It works with a read-only root, tmpfs `HOME`, non-root user and `cap-drop ALL`. |
+| S2 | With `.git` read-only, does Claude Code still get git context, and do host commits work? | **Yes to both.** |
+| S3 | Does Claude Code work through an internal network plus a CONNECT proxy, sidecar or host-bound? | **Yes, as a sidecar.** Only `api.anthropic.com` is needed. |
+| S4 | What does a usage-limit error look like, and does it carry a reset time? | **A typed error with the reset time.** Usage is also reported live on every run. |
 
-Findings go into this document, and sanitised stream-json captures go under `crates/dsf/tests/fixtures/` as parser test fixtures.
+**S1: authentication and output.**
+- `system/init` reports `apiKeySource: "none"`, which confirms OAuth is in use.
+- The stream is `system/init`, then `assistant` and `user` (tool result) messages, then `rate_limit_event`, then `result`.
+- The `result` message carries `subtype`, `is_error`, `num_turns`, `result`, `usage`, `total_cost_usd`, `permission_denials`, `stop_reason` and `terminal_reason`. The cost is notional on a subscription, but useful in the digest.
+- With `--json-schema`, Claude gets a `StructuredOutput` tool. The validated object arrives as `result.structured_output`, with the same JSON as text in `result`. dsf reads the stage outcome from `structured_output.outcome` and never parses prose.
+- With `--restricted --tools Read,Grep,Glob`, the tool list is exactly Glob, Grep and Read, plus `StructuredOutput` when a schema is given.
+- The write-stage flags in §6.4 ran edits and shell commands with no prompts and no permission denials.
+- The CLI defaults to a model of its own choosing, so dsf always passes `--model`.
+
+**S2: read-only `.git`.**
+- Claude Code starts normally with `.git` mounted read-only. `git status`, `log` and `diff` work in the container.
+- `git commit` fails with `Unable to create '/work/.git/index.lock': Read-only file system` (exit 128). Claude reports the failure rather than retrying.
+- Writing a hook or git config fails the same way.
+- Host-side `HostGit`-style commands see the agent's changes and can commit them.
+- Docker creates an empty `.git/` directory in the host worktree as the mount point. Git ignores it.
+- A hostile `.gitattributes` filter does nothing, because filter drivers need config the agent can't write.
+- To re-check on the Linux VM in P6: these runs were on macOS, where Docker Desktop masks file ownership, so git's "dubious ownership" check couldn't be exercised. Containers run as the `factory` user's uid, so ownership should match.
+
+**S3: egress.**
+- Claude Code honours `HTTPS_PROXY`. With only `api.anthropic.com` allowed, it completes normally.
+- With default settings it also tries to send logs to Datadog (`http-intake.logs.us5.datadoghq.com`); the proxy refuses this with no ill effect.
+- With `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` it tries nothing else, and analytics report as disabled. `rate_limit_event` still arrives.
+- From the internal network, direct HTTPS fails because there is no DNS and no route, and the proxy answers 403 to a host that isn't allowlisted.
+- The proxy runs as a sidecar container attached to both networks (§3). Traffic between the agent and the proxy stays on Docker networks, so the host firewall's inbound policy never applies to it, unlike a proxy bound on the host.
+
+**S4: usage limits.**
+- Every run emits `rate_limit_event`. Its `rate_limit_info` holds:
+  - `status`: `allowed`, `allowed_warning` or `rejected`;
+  - `resetsAt`: unix seconds;
+  - `rateLimitType`: `five_hour`, `seven_day`, `seven_day_opus`, `seven_day_sonnet`, `seven_day_overage_included` or `overage`;
+  - `utilization`, plus overage fields;
+  - `unifiedWindows`, giving `utilization` and `resetsAt` for the five-hour and seven-day windows.
+- A refused request ends in an API error of kind `usage_limit_reached`, with `error: "rate_limit"`. Its `api_error_params.rate_limit_info` has the same shape, with status `rejected`.
+- This comes from the CLI's own message schema; a real refusal wasn't triggered, to avoid spending the plan. dsf stores every stage's raw stream, so the first real one becomes a fixture.
+- Because usage is visible on every run, a *headroom* setting is possible: stop claiming while either window's utilization is above a threshold, leaving the rest of the plan for interactive use. Proposed for P4.
 
 ## Phases and exit criteria
 
