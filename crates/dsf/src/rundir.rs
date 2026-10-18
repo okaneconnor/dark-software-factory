@@ -9,10 +9,39 @@
 //! scratch/         host-only temporary files
 //! ```
 
+use std::fs::{File, OpenOptions, TryLockError};
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
+
+/// One dsf process per state directory, so no two ever resume, or clean
+/// up after, the same run. The lock goes when the process does, however
+/// it ends.
+pub struct StateLock {
+    _file: File,
+}
+
+impl StateLock {
+    pub fn acquire(state_dir: &Path) -> Result<Self> {
+        let path = state_dir.join("dsf.lock");
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        match file.try_lock() {
+            Ok(()) => Ok(Self { _file: file }),
+            Err(TryLockError::WouldBlock) => {
+                bail!("another dsf is using {}", state_dir.display())
+            }
+            Err(TryLockError::Error(error)) => {
+                Err(error).with_context(|| format!("locking {}", path.display()))
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct RunDir {
@@ -86,6 +115,16 @@ fn private_dir(path: &Path, allow_existing: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_process_holds_the_state_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = StateLock::acquire(dir.path()).unwrap();
+        let error = StateLock::acquire(dir.path()).err().unwrap().to_string();
+        assert!(error.contains("another dsf"), "{error}");
+        drop(held);
+        StateLock::acquire(dir.path()).unwrap();
+    }
     use std::os::unix::fs::PermissionsExt;
 
     #[test]

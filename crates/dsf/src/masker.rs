@@ -6,6 +6,8 @@
 //! sends), and anything shaped like an Anthropic or GitHub token, which
 //! catches secrets the agent found or invented.
 
+use std::sync::{PoisonError, RwLock};
+
 use secrecy::{ExposeSecret, SecretString};
 
 pub const REDACTED: &str = "[REDACTED]";
@@ -25,9 +27,11 @@ const TOKEN_SHAPES: [(&str, usize); 7] = [
     ("ghr_", 30),
 ];
 
+/// Shared across a run's tasks; secrets minted later, such as hourly
+/// GitHub tokens, are added as they appear.
 #[derive(Default)]
 pub struct Masker {
-    literals: Vec<SecretString>,
+    literals: RwLock<Vec<SecretString>>,
 }
 
 /// A secret found by [`Masker::find`]. It says where, never what.
@@ -53,18 +57,27 @@ impl Masker {
 
     /// Registers a secret value to hide. Values too short to mask safely
     /// are ignored.
-    pub fn add(&mut self, secret: &SecretString) {
-        if secret.expose_secret().len() >= MIN_LITERAL_LEN {
-            self.literals.push(secret.clone());
-            // Longest first, so a secret containing another is masked whole.
-            self.literals
-                .sort_by_key(|literal| std::cmp::Reverse(literal.expose_secret().len()));
+    pub fn add(&self, secret: &SecretString) {
+        let value = secret.expose_secret();
+        if value.len() < MIN_LITERAL_LEN {
+            return;
         }
+        let mut literals = self
+            .literals
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        if literals.iter().any(|known| known.expose_secret() == value) {
+            return;
+        }
+        literals.push(secret.clone());
+        // Longest first, so a secret containing another is masked whole.
+        literals.sort_by_key(|literal| std::cmp::Reverse(literal.expose_secret().len()));
     }
 
     pub fn mask(&self, text: &str) -> String {
+        let literals = self.literals.read().unwrap_or_else(PoisonError::into_inner);
         let mut out = text.to_owned();
-        for literal in &self.literals {
+        for literal in literals.iter() {
             let value = literal.expose_secret();
             if out.contains(value) {
                 out = out.replace(value, REDACTED);
@@ -76,11 +89,11 @@ impl Masker {
     /// Where `text` contains a secret, line by line. Used on the exact diff
     /// before a push; any finding stops the push.
     pub fn find(&self, text: &str) -> Vec<Finding> {
+        let literals = self.literals.read().unwrap_or_else(PoisonError::into_inner);
         let mut findings = Vec::new();
         for (index, line) in text.lines().enumerate() {
             let line_number = index + 1;
-            if self
-                .literals
+            if literals
                 .iter()
                 .any(|literal| line.contains(literal.expose_secret()))
             {
@@ -152,7 +165,7 @@ mod tests {
     use super::*;
 
     fn masker_with(secrets: &[&str]) -> Masker {
-        let mut masker = Masker::new();
+        let masker = Masker::new();
         for secret in secrets {
             masker.add(&SecretString::from(*secret));
         }

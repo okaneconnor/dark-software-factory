@@ -3,6 +3,8 @@
 
 pub mod agent;
 pub mod engine;
+pub mod factory;
+pub mod github;
 pub mod hostgit;
 pub mod masker;
 pub mod prompts;

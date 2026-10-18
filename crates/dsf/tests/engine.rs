@@ -7,63 +7,16 @@
 // allow-unwrap-in-tests, and a failed precondition should panic here.
 #![allow(clippy::unwrap_used)]
 
+mod support;
+
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use dsf::engine::{Config, Egress, Engine, Issue, ResumeOptions, RunEnd};
 use dsf::store::{Store, SuspendReason};
 use dsf_core::clamp::Caps;
-
-const FAKE_IMAGE: &str = "dsf-fake-agent:test";
-const TOKEN: &str = "sk-ant-oat01-fake-token-for-tests-only-0123456789";
-
-fn enabled() -> bool {
-    static BUILT: OnceLock<bool> = OnceLock::new();
-    if std::env::var_os("DSF_DOCKER_TESTS").is_none_or(|v| v != "1") {
-        eprintln!("skipped: set DSF_DOCKER_TESTS=1 to run Docker tests");
-        return false;
-    }
-    *BUILT.get_or_init(|| {
-        let context = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fake-agent");
-        let status = std::process::Command::new("docker")
-            .args(["build", "--quiet", "--tag", FAKE_IMAGE])
-            .arg(context)
-            .stdout(std::process::Stdio::null())
-            .status()
-            .unwrap();
-        assert!(status.success(), "building {FAKE_IMAGE} failed");
-        true
-    })
-}
-
-fn git(dir: &Path, args: &[&str]) -> String {
-    let output = std::process::Command::new("git")
-        .current_dir(dir)
-        .env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap())
-        .env("HOME", "/nonexistent")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .args([
-            "-c",
-            "user.name=test",
-            "-c",
-            "user.email=test@example.invalid",
-            "-c",
-            "init.defaultBranch=main",
-        ])
-        .args(args)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "git {args:?}: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout).unwrap()
-}
+use support::{FAKE_IMAGE, TOKEN, enabled, git};
 
 /// A repository with a bug and a gate that catches it, a bare remote to
 /// publish to, and a state directory.
@@ -128,7 +81,6 @@ impl World {
             caps: Caps::default(),
             extra_protected: Vec::new(),
             claude_token: TOKEN.to_owned().into(),
-            require_approval: false,
         };
         let store = Store::open(&self.state.join("dsf.sqlite")).unwrap();
         let sandbox = dsf::sandbox::Sandbox::connect().unwrap();
@@ -151,6 +103,8 @@ impl World {
             author: "octocat".to_owned(),
             clone_url: self.origin.display().to_string(),
             publish_url: format!("file://{}", self.remote.display()),
+            comments: Vec::new(),
+            require_approval: false,
         }
     }
 

@@ -13,6 +13,12 @@ You are fixing a change in the repository in your working directory. It was made
 fake-implement: fix-calc
 </issue>
 
+Comments on the issue from maintainers, oldest first (older ones left out: 1):
+
+<comment author="octocat">
+Integers only, please.
+</comment>
+
 The plan it follows:
 
 <plan>

@@ -1,13 +1,16 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-
+use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
+use dsf::engine::RunEnd;
+use dsf::factory::Outcome;
 use dsf_core::clamp::Caps;
-use dsf_core::config::Config;
+use dsf_core::config::{Config, RepoSlug};
 use dsf_core::workflow::{self, Workflow};
 
 /// Turns approved GitHub issues into verified draft pull requests.
@@ -28,6 +31,9 @@ enum Command {
     /// Check the configuration file.
     #[command(subcommand)]
     Config(ConfigCommand),
+    /// Manage the factory's labels in a repository.
+    #[command(subcommand)]
+    Labels(LabelsCommand),
     /// Run the egress proxy. dsf starts this in its proxy sidecar container.
     Proxy {
         #[arg(long, default_value = "0.0.0.0:3128")]
@@ -40,13 +46,16 @@ enum Command {
 
 #[derive(clap::Args)]
 struct RunArgs {
-    /// Work on a local repository, with no GitHub involved.
+    /// The GitHub issue to work on, e.g. octocat/hello#12. Its repository
+    /// must be in the config.
     #[arg(
-        long,
-        value_name = "REPO",
-        required_unless_present = "resume",
-        conflicts_with = "resume"
+        value_name = "OWNER/REPO#N",
+        required_unless_present_any = ["local", "resume"],
+        conflicts_with_all = ["local", "resume"]
     )]
+    issue: Option<IssueRef>,
+    /// Work on a local repository, with no GitHub involved.
+    #[arg(long, value_name = "REPO", conflicts_with = "resume")]
     local: Option<PathBuf>,
     /// The issue as markdown: a `# Title` line, then the body.
     #[arg(long, value_name = "FILE", requires = "local")]
@@ -56,21 +65,24 @@ struct RunArgs {
     /// Where to push the result branch. Defaults to the local repository.
     #[arg(long, value_name = "URL")]
     publish_to: Option<String>,
-    /// Resume a suspended or interrupted run.
+    /// Resume a suspended or interrupted local run. GitHub runs continue
+    /// with `dsf run OWNER/REPO#N`.
     #[arg(long, value_name = "RUN")]
     resume: Option<i64>,
     /// Approve the plan of a run waiting at its gate.
     #[arg(long, requires = "resume")]
     approve: bool,
     /// Make gate stages wait for approval.
-    #[arg(long)]
+    #[arg(long, requires = "local")]
     require_approval: bool,
-    /// Where runs and their database live.
+    /// Where runs and their database live. Defaults to the config's
+    /// `state_dir` for GitHub runs, `~/.local/state/dsf` for local ones.
     #[arg(long, value_name = "DIR")]
     state_dir: Option<PathBuf>,
-    /// The image agent and verify stages run in.
-    #[arg(long, default_value = "dsf-worker:dev", value_name = "IMAGE")]
-    image: String,
+    /// The image agent and verify stages run in. Defaults to the config's
+    /// `images.worker` for GitHub runs, `dsf-worker:dev` for local ones.
+    #[arg(long, value_name = "IMAGE")]
+    image: Option<String>,
     #[arg(long, default_value = "claude-sonnet-5-5")]
     model: String,
     /// How agents reach the internet: through the egress proxy, or not at all.
@@ -79,15 +91,63 @@ struct RunArgs {
     /// The dsf image the proxy sidecar runs from.
     #[arg(long, default_value = "dsf:dev", value_name = "IMAGE")]
     dsf_image: String,
-    /// The Claude OAuth token, from `claude setup-token`.
+    /// The Claude OAuth token, from `claude setup-token`. Defaults to
+    /// `$CREDENTIALS_DIRECTORY/claude-oauth-token`, then
+    /// `~/.config/dsf/claude-oauth-token`.
     #[arg(long, value_name = "FILE")]
     token_file: Option<PathBuf>,
+    #[command(flatten)]
+    github: GitHubArgs,
     /// Prefix for this dsf's container names and labels.
     #[arg(long, default_value = "dsf", hide = true)]
     instance: String,
     /// Longest an agent stage may run.
     #[arg(long, default_value = "45m", value_parser = parse_duration)]
     agent_timeout: Duration,
+}
+
+/// How to reach GitHub, for commands that do.
+#[derive(clap::Args)]
+struct GitHubArgs {
+    /// The config file. Defaults to `$DSF_CONFIG`, then
+    /// `~/.config/dsf/config.toml` if it exists, then `/etc/dsf/config.toml`.
+    #[arg(long, value_name = "FILE")]
+    config: Option<PathBuf>,
+    /// The GitHub App's private key. Defaults to
+    /// `$CREDENTIALS_DIRECTORY/github-app.pem`, then
+    /// `~/.config/dsf/github-app.pem`.
+    #[arg(long, value_name = "FILE")]
+    github_key: Option<PathBuf>,
+    #[arg(long, default_value = dsf::github::API, hide = true)]
+    github_api: String,
+    #[arg(long, default_value = dsf::factory::GIT_BASE, hide = true)]
+    git_base: String,
+}
+
+/// `owner/repo#N`.
+#[derive(Clone)]
+struct IssueRef {
+    repo: RepoSlug,
+    number: u64,
+}
+
+impl FromStr for IssueRef {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let (repo, number) = text
+            .split_once('#')
+            .ok_or_else(|| format!("`{text}` is not owner/repo#N"))?;
+        let number = number
+            .parse::<u64>()
+            .ok()
+            .filter(|n| *n > 0)
+            .ok_or_else(|| format!("`{number}` is not an issue number"))?;
+        Ok(Self {
+            repo: repo.parse()?,
+            number,
+        })
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -116,6 +176,18 @@ enum ConfigCommand {
     Validate { file: PathBuf },
 }
 
+#[derive(Subcommand)]
+enum LabelsCommand {
+    /// Create the factory: labels in a configured repository, and put
+    /// right any that differ. Safe to run again.
+    Init {
+        #[arg(value_name = "OWNER/REPO")]
+        repo: RepoSlug,
+        #[command(flatten)]
+        github: GitHubArgs,
+    },
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
@@ -128,6 +200,7 @@ fn main() -> ExitCode {
             Ok(())
         }
         Command::Config(ConfigCommand::Validate { file }) => validate_config(&file),
+        Command::Labels(LabelsCommand::Init { repo, github }) => init_labels(&repo, &github),
         Command::Proxy { listen, allow } => run_proxy(listen, &allow),
     };
     match result {
@@ -198,40 +271,21 @@ fn load_config(file: &Path) -> Result<Config> {
 const EXIT_BLOCKED: u8 = 2;
 const EXIT_SUSPENDED: u8 = 3;
 const EXIT_PUBLISH_FAILED: u8 = 4;
+const EXIT_SKIPPED: u8 = 5;
 
 fn run_issue(args: &RunArgs) -> ExitCode {
     let outcome = tokio::runtime::Runtime::new()
         .map_err(anyhow::Error::from)
         .and_then(|runtime| runtime.block_on(run_issue_async(args)));
     match outcome {
-        Ok(dsf::engine::RunEnd::Published {
-            run_id,
-            branch,
-            sha,
-        }) => {
-            println!("run {run_id}: published {branch} at {sha}");
-            ExitCode::SUCCESS
+        Ok(Outcome::Ended(end)) => report_end(&end),
+        Ok(Outcome::Skipped(reason)) => {
+            println!("skipped: {reason}");
+            ExitCode::from(EXIT_SKIPPED)
         }
-        Ok(dsf::engine::RunEnd::Blocked { run_id, reason }) => {
-            println!("run {run_id}: blocked: {reason}");
-            ExitCode::from(EXIT_BLOCKED)
-        }
-        Ok(dsf::engine::RunEnd::Suspended {
-            run_id,
-            detail,
-            resume_after,
-            ..
-        }) => {
-            match resume_after {
-                Some(at) => println!("run {run_id}: suspended until {at}: {detail}"),
-                None => println!("run {run_id}: suspended: {detail}"),
-            }
-            println!("resume with: dsf run --resume {run_id}");
+        Ok(Outcome::AwaitingApproval { run_id }) => {
+            println!("run {run_id}: waiting for factory:plan-approved on the issue");
             ExitCode::from(EXIT_SUSPENDED)
-        }
-        Ok(dsf::engine::RunEnd::PublishFailed { run_id, reason }) => {
-            println!("run {run_id}: {reason}");
-            ExitCode::from(EXIT_PUBLISH_FAILED)
         }
         Err(error) => {
             eprintln!("error: {error:#}");
@@ -240,19 +294,68 @@ fn run_issue(args: &RunArgs) -> ExitCode {
     }
 }
 
-async fn run_issue_async(args: &RunArgs) -> Result<dsf::engine::RunEnd> {
+fn report_end(end: &RunEnd) -> ExitCode {
+    match end {
+        RunEnd::Published {
+            run_id,
+            branch,
+            sha,
+            pull_request,
+        } => {
+            println!("run {run_id}: published {branch} at {sha}");
+            if let Some(pull_request) = pull_request {
+                println!("draft pull request: {}", pull_request.url);
+            }
+            ExitCode::SUCCESS
+        }
+        RunEnd::Blocked { run_id, reason } => {
+            println!("run {run_id}: blocked: {reason}");
+            ExitCode::from(EXIT_BLOCKED)
+        }
+        RunEnd::Suspended {
+            run_id,
+            detail,
+            resume_after,
+            ..
+        } => {
+            match resume_after {
+                Some(at) => println!("run {run_id}: suspended until {at}: {detail}"),
+                None => println!("run {run_id}: suspended: {detail}"),
+            }
+            ExitCode::from(EXIT_SUSPENDED)
+        }
+        RunEnd::PublishFailed { run_id, reason } => {
+            println!("run {run_id}: {reason}");
+            ExitCode::from(EXIT_PUBLISH_FAILED)
+        }
+    }
+}
+
+async fn run_issue_async(args: &RunArgs) -> Result<Outcome> {
     use dsf::engine::{Config, Engine, ResumeOptions};
 
+    if let Some(target) = &args.issue {
+        return run_github_issue(args, target).await;
+    }
+
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    let state_dir = state_dir(args, home.as_deref())?;
+    let state_dir = state_dir(args.state_dir.as_deref(), home.as_deref(), None)?;
+    let _lock = dsf::rundir::StateLock::acquire(&state_dir)?;
     let token = claude_token(args, home.as_deref())?;
     let sandbox = dsf::sandbox::Sandbox::connect()?;
     sandbox.ping().await?;
-    let egress = egress(&sandbox, args).await?;
+    let builtin: Vec<String> = dsf_core::config::BUILTIN_EGRESS
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    let egress = egress(&sandbox, args, &builtin).await?;
     let config = Config {
         instance: args.instance.clone(),
         state_dir: state_dir.clone(),
-        worker_image: args.image.clone(),
+        worker_image: args
+            .image
+            .clone()
+            .unwrap_or_else(|| "dsf-worker:dev".to_owned()),
         model: args.model.clone(),
         max_turns: 80,
         agent_timeout: args.agent_timeout,
@@ -261,13 +364,15 @@ async fn run_issue_async(args: &RunArgs) -> Result<dsf::engine::RunEnd> {
         caps: Caps::default(),
         extra_protected: Vec::new(),
         claude_token: token,
-        require_approval: args.require_approval,
     };
     let store = dsf::store::Store::open(&state_dir.join("dsf.sqlite"))?;
     let report = Box::new(|line: &str| println!("{line}"));
     let engine = Engine::new(config, store, sandbox, dsf::hostgit::Git::locate()?, report)?;
-    match args.resume {
+    let end = match args.resume {
         Some(run_id) => {
+            if !engine.stored_run(run_id)?.repo.starts_with("local/") {
+                bail!("run {run_id} is a GitHub run; continue it with `dsf run OWNER/REPO#N`");
+            }
             engine
                 .resume(
                     run_id,
@@ -275,52 +380,162 @@ async fn run_issue_async(args: &RunArgs) -> Result<dsf::engine::RunEnd> {
                         approve: args.approve,
                     },
                 )
-                .await
+                .await?
         }
-        None => engine.start(&local_issue(args)?).await,
+        None => engine.start(&local_issue(args)?).await?,
+    };
+    if let RunEnd::Suspended { run_id, .. } = &end {
+        println!("resume with: dsf run --resume {run_id}");
+    }
+    Ok(Outcome::Ended(end))
+}
+
+/// One GitHub issue, from the config's repos, as the GitHub App.
+async fn run_github_issue(args: &RunArgs, target: &IssueRef) -> Result<Outcome> {
+    use dsf::engine::{Config as EngineConfig, Engine};
+
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let (config, github) = connect_github(&args.github, home.as_deref())?;
+    let state_dir = state_dir(
+        args.state_dir.as_deref(),
+        home.as_deref(),
+        Some(&config.state_dir),
+    )?;
+    let _lock = dsf::rundir::StateLock::acquire(&state_dir)?;
+    let token = claude_token(args, home.as_deref())?;
+    let sandbox = dsf::sandbox::Sandbox::connect()?;
+    sandbox.ping().await?;
+    let egress = egress(&sandbox, args, &config.egress).await?;
+    let engine_config = EngineConfig {
+        instance: args.instance.clone(),
+        state_dir: state_dir.clone(),
+        worker_image: args
+            .image
+            .clone()
+            .unwrap_or_else(|| config.worker_image.clone()),
+        model: args.model.clone(),
+        max_turns: 80,
+        agent_timeout: args.agent_timeout,
+        limits: dsf::sandbox::Limits::default(),
+        egress,
+        caps: config.caps,
+        extra_protected: config.protect_extra.clone(),
+        claude_token: token,
+    };
+    let store = dsf::store::Store::open(&state_dir.join("dsf.sqlite"))?;
+    let report = Box::new(|line: &str| println!("{line}"));
+    let engine = Engine::new(
+        engine_config,
+        store,
+        sandbox,
+        dsf::hostgit::Git::locate()?,
+        report,
+    )?
+    .with_forge(Box::new(dsf::factory::GitHubForge::new(github.clone())));
+    let factory = dsf::factory::Factory::new(engine, github, config, &args.github.git_base);
+    factory.work_on(&target.repo, target.number).await
+}
+
+fn init_labels(repo: &RepoSlug, args: &GitHubArgs) -> Result<()> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let (config, github) = connect_github(args, home.as_deref())?;
+    let repo = &config
+        .repo(repo)
+        .with_context(|| format!("{repo} is not one of the configured repos"))?
+        .slug;
+    let runtime = tokio::runtime::Runtime::new()?;
+    let done = runtime.block_on(dsf::factory::init_labels(&github, repo))?;
+    println!("{repo}:");
+    for line in done {
+        println!("  {line}");
+    }
+    Ok(())
+}
+
+/// The config, and a GitHub client acting as the config's app.
+fn connect_github(
+    args: &GitHubArgs,
+    home: Option<&Path>,
+) -> Result<(Config, Arc<dsf::github::GitHub>)> {
+    let config_file = config_path(args.config.as_deref(), home);
+    let config = load_config(&config_file)?;
+    let app_id = config
+        .github_app_id
+        .with_context(|| format!("{}: set github.app_id", config_file.display()))?;
+    let key_file = match &args.github_key {
+        Some(file) => file.clone(),
+        None => credential("github-app.pem", home)?,
+    };
+    let key = dsf::github::app::AppKey::load(app_id, &key_file)?;
+    let github = dsf::github::GitHub::new(key, &args.github_api)?;
+    Ok((config, Arc::new(github)))
+}
+
+fn config_path(explicit: Option<&Path>, home: Option<&Path>) -> PathBuf {
+    if let Some(file) = explicit {
+        return file.to_owned();
+    }
+    if let Some(file) = std::env::var_os("DSF_CONFIG") {
+        return PathBuf::from(file);
+    }
+    home.map(|home| home.join(".config/dsf/config.toml"))
+        .filter(|file| file.is_file())
+        .unwrap_or_else(|| PathBuf::from("/etc/dsf/config.toml"))
+}
+
+/// A secret file: from systemd's credentials directory when running as a
+/// service, otherwise from ~/.config/dsf.
+fn credential(name: &str, home: Option<&Path>) -> Result<PathBuf> {
+    if let Some(dir) = std::env::var_os("CREDENTIALS_DIRECTORY") {
+        return Ok(PathBuf::from(dir).join(name));
+    }
+    match home {
+        Some(home) => Ok(home.join(".config/dsf").join(name)),
+        None => bail!("set HOME, or pass the {name} file explicitly"),
     }
 }
 
-fn state_dir(args: &RunArgs, home: Option<&Path>) -> Result<PathBuf> {
-    let dir = match (&args.state_dir, home) {
-        (Some(dir), _) => dir.clone(),
-        (None, Some(home)) => home.join(".local/state/dsf"),
-        (None, None) => bail!("set --state-dir or HOME"),
+fn state_dir(
+    explicit: Option<&Path>,
+    home: Option<&Path>,
+    configured: Option<&Path>,
+) -> Result<PathBuf> {
+    let dir = match (explicit, configured, home) {
+        (Some(dir), _, _) | (None, Some(dir), _) => dir.to_owned(),
+        (None, None, Some(home)) => home.join(".local/state/dsf"),
+        (None, None, None) => bail!("set --state-dir or HOME"),
     };
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     Ok(dir.canonicalize()?)
 }
 
 fn claude_token(args: &RunArgs, home: Option<&Path>) -> Result<secrecy::SecretString> {
-    match (&args.token_file, home, args.egress) {
-        (Some(file), _, _) => read_token(file),
-        (None, Some(home), EgressArg::Proxy) => {
-            read_token(&home.join(".config/dsf/claude-oauth-token"))
-        }
+    match (&args.token_file, args.egress) {
+        (Some(file), _) => read_token(file),
+        (None, EgressArg::Proxy) => read_token(&credential("claude-oauth-token", home)?),
         // Offline runs use fake agents, which need no token.
-        (None, _, EgressArg::None) => Ok(secrecy::SecretString::from("offline-no-token")),
-        (None, None, EgressArg::Proxy) => bail!("set --token-file or HOME"),
+        (None, EgressArg::None) => Ok(secrecy::SecretString::from("offline-no-token")),
     }
 }
 
 /// Sets up the agents' network and the proxy sidecar, unless offline.
-async fn egress(sandbox: &dsf::sandbox::Sandbox, args: &RunArgs) -> Result<dsf::engine::Egress> {
+async fn egress(
+    sandbox: &dsf::sandbox::Sandbox,
+    args: &RunArgs,
+    allow: &[String],
+) -> Result<dsf::engine::Egress> {
     const NETWORK: &str = "dsf-agents";
     const PROXY: &str = "dsf-proxy";
     if args.egress == EgressArg::None {
         return Ok(dsf::engine::Egress::None);
     }
     sandbox.ensure_internal_network(NETWORK).await?;
-    let allow: Vec<String> = dsf_core::config::BUILTIN_EGRESS
-        .iter()
-        .map(ToString::to_string)
-        .collect();
     sandbox
         .ensure_proxy(&dsf::sandbox::ProxySidecar {
             name: PROXY,
             image: &args.dsf_image,
             internal_network: NETWORK,
-            allow: &allow,
+            allow,
         })
         .await?;
     Ok(dsf::engine::Egress::Proxy {
@@ -350,6 +565,8 @@ fn local_issue(args: &RunArgs) -> Result<dsf::engine::Issue> {
         author: "local".to_owned(),
         clone_url: url.clone(),
         publish_url: args.publish_to.clone().unwrap_or(url),
+        comments: Vec::new(),
+        require_approval: args.require_approval,
     })
 }
 
