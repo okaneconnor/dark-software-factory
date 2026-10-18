@@ -129,9 +129,10 @@ struct WorkerArgs {
     /// How agents reach the internet: through the egress proxy, or not at all.
     #[arg(long, value_enum, default_value = "proxy")]
     egress: EgressArg,
-    /// The dsf image the proxy sidecar runs from.
-    #[arg(long, default_value = "dsf:dev", value_name = "IMAGE")]
-    dsf_image: String,
+    /// The dsf image the proxy sidecar runs from. Defaults to the config's
+    /// `images.dsf`, then `dsf:dev`.
+    #[arg(long, value_name = "IMAGE")]
+    dsf_image: Option<String>,
     /// The Claude OAuth token, from `claude setup-token`. Defaults to
     /// `$CREDENTIALS_DIRECTORY/claude-oauth-token`, then
     /// `~/.config/dsf/claude-oauth-token`.
@@ -416,7 +417,7 @@ async fn run_issue_async(args: &RunArgs) -> Result<Outcome> {
         .iter()
         .map(ToString::to_string)
         .collect();
-    let egress = egress(&sandbox, worker, &builtin).await?;
+    let egress = egress(&sandbox, worker, dsf_image(worker, None), &builtin).await?;
     let config = Config {
         instance: worker.instance.clone(),
         state_dir: state_dir.clone(),
@@ -487,7 +488,13 @@ async fn github_factory(
     let token = claude_token(worker, home)?;
     let sandbox = dsf::sandbox::Sandbox::connect()?;
     sandbox.ping().await?;
-    let egress = egress(&sandbox, worker, &config.egress).await?;
+    let egress = egress(
+        &sandbox,
+        worker,
+        dsf_image(worker, Some(&config)),
+        &config.egress,
+    )
+    .await?;
     let engine_config = EngineConfig {
         instance: worker.instance.clone(),
         state_dir: state_dir.to_owned(),
@@ -665,7 +672,7 @@ fn doctor(args: &WorkerArgs) -> Result<()> {
         .unwrap_or_else(|| config.worker_image.clone());
     let mut images = vec![("worker", worker_image.as_str())];
     if args.egress == EgressArg::Proxy {
-        images.push(("proxy", args.dsf_image.as_str()));
+        images.push(("proxy", dsf_image(args, Some(&config))));
     }
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async {
@@ -809,10 +816,20 @@ fn claude_token(args: &WorkerArgs, home: Option<&Path>) -> Result<secrecy::Secre
     }
 }
 
+/// The image the proxy sidecar runs: `--dsf-image`, the config's
+/// `images.dsf`, or a locally built `dsf:dev`.
+fn dsf_image<'a>(args: &'a WorkerArgs, config: Option<&'a Config>) -> &'a str {
+    args.dsf_image
+        .as_deref()
+        .or_else(|| config.and_then(|config| config.dsf_image.as_deref()))
+        .unwrap_or("dsf:dev")
+}
+
 /// Sets up the agents' network and the proxy sidecar, unless offline.
 async fn egress(
     sandbox: &dsf::sandbox::Sandbox,
     args: &WorkerArgs,
+    image: &str,
     allow: &[String],
 ) -> Result<dsf::engine::Egress> {
     const NETWORK: &str = "dsf-agents";
@@ -824,7 +841,7 @@ async fn egress(
     sandbox
         .ensure_proxy(&dsf::sandbox::ProxySidecar {
             name: PROXY,
-            image: &args.dsf_image,
+            image,
             internal_network: NETWORK,
             allow,
         })

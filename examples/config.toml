@@ -50,8 +50,11 @@ max_stages = 16
 allow = ["registry.npmjs.org", "pypi.org", "files.pythonhosted.org", "index.crates.io", "static.crates.io"]
 
 [images]
-# Pin by digest in production.
-worker = "ghcr.io/your-github-login/dsf-worker:latest"
+# Pin both by the digests in the release notes, e.g.
+# "ghcr.io/okaneconnor/dsf-worker@sha256:...".
+worker = "ghcr.io/your-github-login/dsf-worker:v0.1.0"
+# dsf's own image, which the egress proxy sidecar runs.
+dsf = "ghcr.io/your-github-login/dsf:v0.1.0"
 
 [protect]
 # Paths agents may not change, in addition to .factory/, .github/,

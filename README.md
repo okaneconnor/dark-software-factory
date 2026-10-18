@@ -53,8 +53,8 @@ Each target repo can tune this pipeline in `.factory/workflow.toml`, within limi
 | P1 | Core model: workflows, routing, labels, scheduling rules | Done |
 | P2 | Local engine: host git, sandbox, agent adapter, verify loop, store | Done |
 | P3 | GitHub: claiming, labels, publishing draft PRs | Done |
-| P4 | Unattended running: `dsf tick` on a timer, night window, backoff, weekly usage cap, crash recovery, digest, doctor | **In progress** |
-| P5 | Packaging: release binary and worker image | Planned |
+| P4 | Unattended running: `dsf tick` on a timer, night window, backoff, weekly usage cap, crash recovery, digest, doctor | Done |
+| P5 | Packaging: a tag publishes a static binary and the dsf and worker images | **In progress** |
 | P6 | First deployment and dogfooding | Planned |
 | P7 | Read-only web board: a kanban of ready, running, awaiting approval, review and blocked | Planned |
 
