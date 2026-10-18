@@ -6,4 +6,5 @@ pub mod hostgit;
 pub mod masker;
 pub mod proxy;
 pub mod rundir;
+pub mod sandbox;
 pub mod store;
