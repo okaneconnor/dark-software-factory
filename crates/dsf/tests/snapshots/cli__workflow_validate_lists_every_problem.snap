@@ -1,0 +1,8 @@
+---
+source: crates/dsf/tests/cli.rs
+expression: "stderr.replace(&path.display().to_string(), \"workflow.toml\")"
+---
+error: workflow.toml: invalid workflow:
+  - stage `implement`: prompt `../../etc/passwd` must be a plain file name ending in .md.j2
+  - stage `implement`: outcome `failure` has no route in `on`
+  - stage `verify`: `run` must be the path of a script under .factory/, with no arguments (got `make test`)
