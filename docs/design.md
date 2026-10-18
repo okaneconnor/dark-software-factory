@@ -161,10 +161,13 @@ The controls below are what make dsf safe to leave running unattended. [`CLAUDE.
    - Each run has `runs/<id>/repo.git` (non-bare) and `runs/<id>/work`. Containers mount the worktree, and `.git` only read-only. The agent can therefore never write hooks, config, refs, objects or the index, so nothing it does can make a host git command run its code (`core.hooksPath`, `core.fsmonitor`, filter drivers, `includeIf`, `insteadOf` and similar).
    - Every host git call goes through one `HostGit` wrapper:
      - fixed argv;
-     - a cleared environment (`GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`, an empty `HOME`, `GIT_TERMINAL_PROMPT=0`);
-     - `-c core.hooksPath=/dev/null -c core.fsmonitor=false -c commit.gpgsign=false`;
+     - a cleared environment (`GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_ATTR_NOSYSTEM=1`, a nonexistent `HOME`, `GIT_TERMINAL_PROMPT=0`);
+     - `-c core.hooksPath=/dev/null -c core.fsmonitor=false -c commit.gpgsign=false`, plus no credential helper, no `ext::` transport and `transfer.fsckObjects=true`;
      - `--no-verify`.
-   - Diffs are computed between recorded SHAs (`base_sha`, `checkpoint_sha`), never against refs the agent could influence.
+   - Remotes may only be `https://` or local paths, and pushes only go to `factory/` branches.
+   - Before `git add`, the worktree is walked without following symlinks, and any `.git` below the top level is refused, because adding a nested repository makes git read its files. The top-level `.git` is only the empty mount point; host git never looks at it.
+   - Tests plant a config, filter driver and hooks in a worktree `.git`, check that plain git springs them, and check that `HostGit` never does.
+   - Diffs are computed between recorded SHAs (`base_sha`, `checkpoint_sha`), never against refs the agent could influence. Verify runs against a clean export of the checkpoint commit (written through a private index, so the run's own index is untouched), with `.factory/` replaced by the base snapshot. It therefore checks exactly what would be published, not whatever else is lying in the worktree.
    - Pushes use an explicit URL and `<sha>:refs/heads/factory/issue-<n>`. Authentication is a URL-scoped `http.extraheader` passed through `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_*` environment variables, so the token is never written to disk.
 2. **No symlink following.** The host never follows symlinks in a worktree. Agent outputs are read from Claude's stream-json result or from git objects (`git cat-file`). Trees containing gitlinks, `.gitmodules` or symlinks that escape the repo are refused.
 3. **Protected paths.** After **every** agent stage, the change since `base_sha` is checked against `.factory/`, `.github/`, `.claude/`, `.mcp.json` and any operator additions. An entry covers the path itself and everything beneath it, ignoring ASCII case. A violation is deterministic and blocks the run immediately. The `.factory/` snapshot that command stages run is extracted from git objects at `base_sha`, and a snapshot containing a symlink is refused: one could point at a file the agent is free to edit.
@@ -180,7 +183,7 @@ The controls below are what make dsf safe to leave running unattended. [`CLAUDE.
    - DNS filtering on the host is a useful second layer, not a substitute.
 6. **Secret hygiene.**
    - Tokens are held in `secrecy` types.
-   - A masker redacts every known secret value from everything that leaves the host: logs, board pages, GitHub comments and PR bodies, digests.
+   - A masker redacts every known secret value, and the encoded forms dsf sends such as the basic-auth header, from everything that leaves the host: logs, board pages, GitHub comments and PR bodies, digests. It also redacts anything shaped like an Anthropic or GitHub token, which catches secrets the agent found rather than ones dsf holds.
    - Before any push, the exact diff is scanned for literal secret values.
 7. **Trusted input only.**
    - dsf acts only on configured repos, and only on issues whose author **and** the user who applied `factory:ready` are on the operator allowlist, verified through the issue events API. Logins are compared case-insensitively, as GitHub does. This matters because repos, including this one, may be public.
