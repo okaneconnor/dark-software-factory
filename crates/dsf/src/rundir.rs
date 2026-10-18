@@ -24,6 +24,14 @@ pub struct StateLock {
 
 impl StateLock {
     pub fn acquire(state_dir: &Path) -> Result<Self> {
+        match Self::try_acquire(state_dir)? {
+            Some(lock) => Ok(lock),
+            None => bail!("another dsf is using {}", state_dir.display()),
+        }
+    }
+
+    /// `None` if another dsf holds the lock.
+    pub fn try_acquire(state_dir: &Path) -> Result<Option<Self>> {
         let path = state_dir.join("dsf.lock");
         let file = OpenOptions::new()
             .create(true)
@@ -32,10 +40,8 @@ impl StateLock {
             .open(&path)
             .with_context(|| format!("opening {}", path.display()))?;
         match file.try_lock() {
-            Ok(()) => Ok(Self { _file: file }),
-            Err(TryLockError::WouldBlock) => {
-                bail!("another dsf is using {}", state_dir.display())
-            }
+            Ok(()) => Ok(Some(Self { _file: file })),
+            Err(TryLockError::WouldBlock) => Ok(None),
             Err(TryLockError::Error(error)) => {
                 Err(error).with_context(|| format!("locking {}", path.display()))
             }
@@ -122,6 +128,7 @@ mod tests {
         let held = StateLock::acquire(dir.path()).unwrap();
         let error = StateLock::acquire(dir.path()).err().unwrap().to_string();
         assert!(error.contains("another dsf"), "{error}");
+        assert!(StateLock::try_acquire(dir.path()).unwrap().is_none());
         drop(held);
         StateLock::acquire(dir.path()).unwrap();
     }
