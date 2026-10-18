@@ -1,0 +1,4 @@
+# unwrap/expect are denied in product code (see Cargo.toml) but are the
+# clearest way to state a test's preconditions.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true

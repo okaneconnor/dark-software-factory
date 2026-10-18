@@ -1,0 +1,30 @@
+# cargo-deny: supply-chain gate run in CI (`cargo deny check`).
+# Format: cargo-deny 0.20. Generate the full commented template with
+# `cargo deny init` if a new section is needed.
+
+[advisories]
+# Every RustSec advisory fails the build unless listed here with a reason.
+ignore = []
+
+[licenses]
+# Permissive licences only: dsf is MIT and must stay redistributable as a
+# single static binary. Add to this list deliberately, never to get CI green.
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+# Workspace path dependencies are fine; registry wildcards are not.
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+# crates.io only — no git dependencies or alternative registries.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
