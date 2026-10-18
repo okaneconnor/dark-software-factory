@@ -4,6 +4,7 @@
 pub mod agent;
 pub mod hostgit;
 pub mod masker;
+pub mod prompts;
 pub mod proxy;
 pub mod rundir;
 pub mod sandbox;

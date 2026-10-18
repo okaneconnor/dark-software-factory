@@ -1,0 +1,46 @@
+---
+source: crates/dsf/src/prompts.rs
+expression: rendered
+---
+<!-- dsf-stage: fix visit: 2 -->
+You are fixing a change in the repository in your working directory. It was made for GitHub issue #7 in octocat/calc, but it isn't done yet.
+
+<issue>
+# add() subtracts
+
+`add(2, 3)` returns -1.
+
+fake-implement: fix-calc
+</issue>
+
+The plan it follows:
+
+<plan>
+Change `a - b` to `a + b` in calc.py.
+</plan>
+
+Files changed so far:
+
+<diff-stat>
+ calc.py | 2 +-
+ 1 file changed
+</diff-stat>
+
+`.factory/verify.sh` failed. The end of its output:
+
+<verify-output>
+FAILED: expected 5, got -1
+</verify-output>
+
+A reviewer asked for changes:
+
+<review>
+Add a regression test.
+</review>
+
+Fix the cause, not the symptom: don't delete or weaken tests to make them pass. The same rules apply as before:
+
+- Don't modify .factory/, .github/, .claude/, .mcp.json. Any change there stops the run.
+- Don't commit, push or change git configuration. The factory records your changes itself.
+
+When you're done, reply with a short summary of what you changed.

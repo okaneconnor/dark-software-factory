@@ -1,0 +1,25 @@
+<!-- dsf-stage: implement visit: {{ visit }} -->
+You are implementing a planned change in the repository in your working directory.
+
+The task is GitHub issue #{{ issue.number }} in {{ issue.repo }}:
+
+<issue>
+# {{ issue.title }}
+
+{{ issue.body }}
+</issue>
+
+The agreed plan:
+
+<plan>
+{{ plan }}
+</plan>
+
+Rules:
+
+- Make the change the plan describes, adding or updating tests where the repository has them.
+- Don't modify {{ protected | join(", ") }}. Any change there stops the run.
+- Don't commit, push or change git configuration. The git directory is read-only; the factory records your changes itself.
+- Run `.factory/verify.sh` if you can and fix what it reports. If it needs network access you don't have, say so and stop there.
+
+When you're done, reply with a short summary of what you changed.

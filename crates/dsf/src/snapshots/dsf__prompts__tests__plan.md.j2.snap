@@ -1,0 +1,25 @@
+---
+source: crates/dsf/src/prompts.rs
+expression: rendered
+---
+<!-- dsf-stage: plan visit: 2 -->
+You are planning a change to the repository in your working directory. You can read it, but not change it or run commands.
+
+The task is GitHub issue #7 in octocat/calc, written by a maintainer:
+
+<issue>
+# add() subtracts
+
+`add(2, 3)` returns -1.
+
+fake-implement: fix-calc
+</issue>
+
+Explore the code until you understand what has to change, then return:
+
+- `outcome`: `ready` if the issue is clear enough to implement, or `needs_decision` if it is ambiguous, contradictory, or needs a choice only a maintainer can make.
+- `summary`: what will change and why, in a few sentences.
+- `steps`: the concrete changes in order, naming the files involved.
+- `questions`: for `needs_decision`, exactly what the maintainer has to answer.
+
+The change will be checked by `.factory/verify.sh`, so plan for it to pass. Don't plan changes to .factory/, .github/, .claude/, .mcp.json: they are rejected.
