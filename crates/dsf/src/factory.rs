@@ -88,15 +88,13 @@ pub enum Outcome {
     Ended(RunEnd),
 }
 
-/// The time, from the system clock except in tests.
-pub type Clock = Arc<dyn Fn() -> Timestamp + Send + Sync>;
+pub use crate::engine::Clock;
 
 pub struct Factory {
     engine: Engine,
     github: Arc<GitHub>,
     config: Config,
     git_base: String,
-    clock: Clock,
 }
 
 impl Factory {
@@ -107,20 +105,19 @@ impl Factory {
             github,
             config,
             git_base: git_base.to_owned(),
-            clock: Arc::new(Timestamp::now),
         }
     }
 
-    /// Decides with `clock`'s time rather than the system's, so tests can
-    /// say when "now" is.
+    /// Decides, and records, with `clock`'s time rather than the
+    /// system's, so tests can say when "now" is.
     #[must_use]
     pub fn with_clock(mut self, clock: Clock) -> Self {
-        self.clock = clock;
+        self.engine.set_clock(clock);
         self
     }
 
     pub fn now(&self) -> Timestamp {
-        (self.clock)()
+        self.engine.now()
     }
 
     pub fn engine(&self) -> &Engine {
@@ -498,10 +495,10 @@ impl Factory {
                 run_id,
                 reason: SuspendReason::UsageLimit,
                 resume_after,
-                ..
+                detail,
             } => {
                 let mut comment = format!(
-                    "dsf paused this (run {run_id}): the Claude usage limit was reached. \
+                    "dsf paused this (run {run_id}): {detail}. \
                      It's back in the queue and continues from where it stopped"
                 );
                 match resume_after {

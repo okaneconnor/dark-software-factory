@@ -13,6 +13,7 @@ use jiff::{SignedDuration, Timestamp};
 
 use crate::scheduler::{BACKOFF_UNTIL, LAST_TICK, PAUSED, TickRecord, local};
 use crate::store::{Attempt, Run, RunStatus, Store, SuspendReason};
+use crate::usage::{UsageReading, percent};
 
 /// How far back finished runs are shown.
 const RECENT: SignedDuration = SignedDuration::from_hours(7 * 24);
@@ -23,6 +24,7 @@ pub struct Board {
     pub now: Timestamp,
     pub paused: Option<String>,
     pub backoff_until: Option<Timestamp>,
+    pub usage: Option<UsageReading>,
     pub last_tick: Option<TickRecord>,
     /// Unfinished runs, each with its latest attempt.
     pub unfinished: Vec<(Run, Option<Attempt>)>,
@@ -44,6 +46,7 @@ impl Board {
                 .kv_get(BACKOFF_UNTIL)?
                 .and_then(|text| text.parse().ok())
                 .filter(|until| *until > now),
+            usage: UsageReading::load(store)?,
             last_tick: store
                 .kv_get(LAST_TICK)?
                 .and_then(|json| serde_json::from_str(&json).ok()),
@@ -76,7 +79,8 @@ impl Board {
         out
     }
 
-    /// The time, the window, whether claiming is allowed, and the last tick.
+    /// The time, the window, usage, whether claiming is allowed, and the
+    /// last tick.
     fn header(&self, config: &Config, tz: &TimeZone) -> String {
         let at = |when: Timestamp| local(when, tz);
         let mut out = format!("dsf at {} ({})\n", at(self.now), config.timezone);
@@ -95,23 +99,67 @@ impl Board {
             let opens = window.next_open(self.now, tz);
             writeln!(out, "Window:   {hours}, closed until {}", at(opens))
         };
-        let _ = match (&self.paused, self.backoff_until) {
-            (Some(reason), _) => writeln!(
-                out,
-                "Claiming: paused ({reason}); `dsf unpause` restarts it"
-            ),
-            (None, Some(until)) => writeln!(
-                out,
-                "Claiming: backing off after a usage limit until {}",
+        let cap = config.weekly_usage_cap;
+        let _ = writeln!(out, "Usage:    {}", self.usage_text(cap, tz));
+        let capped = self.usage.as_ref().and_then(|reading| {
+            let until = reading.capped_until(cap, self.now)?;
+            // A longer backoff is the real wait.
+            let longest = self.backoff_until.is_none_or(|backoff| backoff <= until);
+            longest.then_some((reading, until))
+        });
+        let claiming = if let Some(reason) = &self.paused {
+            format!("paused ({reason}); `dsf unpause` restarts it")
+        } else if let Some((reading, until)) = capped {
+            format!(
+                "{}, so nothing starts until {}",
+                reading.over_cap(cap),
                 at(until)
-            ),
-            (None, None) => writeln!(out, "Claiming: allowed"),
+            )
+        } else if let Some(until) = self.backoff_until {
+            format!("backing off after a usage limit until {}", at(until))
+        } else {
+            "allowed".to_owned()
         };
+        let _ = writeln!(out, "Claiming: {claiming}");
         let _ = match &self.last_tick {
             Some(tick) => writeln!(out, "Last tick: {}", at(tick.at)),
             None => writeln!(out, "Last tick: never"),
         };
         out
+    }
+
+    /// The last reading of each allowance, e.g. `weekly 62% (resets Thu
+    /// 22 Oct 10:00), 5-hour 12% (resets ...); cap 80%, read Mon 19 Oct
+    /// 23:20`. A window that has reset since is marked so, since its
+    /// figure is out of date.
+    fn usage_text(&self, cap: u8, tz: &TimeZone) -> String {
+        let Some(reading) = &self.usage else {
+            return format!("no reading yet; cap {cap}% of the weekly allowance");
+        };
+        let window = |name: &str, window: Option<crate::agent::Window>| {
+            let window = window?;
+            let used = percent(window.utilization);
+            Some(match window.resets_at {
+                Some(reset) if reset > self.now => {
+                    format!("{name} {used}% (resets {})", local(reset, tz))
+                }
+                Some(_) => format!("{name} {used}% (reset since)"),
+                None => format!("{name} {used}%"),
+            })
+        };
+        let windows: Vec<String> = [
+            window("weekly", reading.usage.seven_day),
+            window("5-hour", reading.usage.five_hour),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let windows = if windows.is_empty() {
+            "no allowance figures".to_owned()
+        } else {
+            windows.join(", ")
+        };
+        format!("{windows}; cap {cap}%, read {}", local(reading.seen_at, tz))
     }
 
     fn columns(&self, config: &Config, tz: &TimeZone) -> Columns {
@@ -353,6 +401,9 @@ mod tests {
         store
             .kv_set(PAUSED, "run 4: Claude authentication failed")
             .unwrap();
+        reading(0.62, "2026-10-22T09:00:00Z", Some(0.12))
+            .save(&mut store)
+            .unwrap();
         let tick = TickRecord {
             at: at("2026-10-19T22:40:00Z"),
             queue: vec![
@@ -378,6 +429,47 @@ mod tests {
         insta::assert_snapshot!(board.render(&config(), &tz));
     }
 
+    fn reading(weekly: f64, resets_at: &str, five_hour: Option<f64>) -> UsageReading {
+        UsageReading {
+            seen_at: at("2026-10-19T22:20:00Z"),
+            usage: crate::agent::Usage {
+                status: "allowed".to_owned(),
+                five_hour: five_hour.map(|utilization| crate::agent::Window {
+                    utilization,
+                    resets_at: Some(at("2026-10-19T23:00:00Z")),
+                }),
+                seven_day: Some(crate::agent::Window {
+                    utilization: weekly,
+                    resets_at: Some(at(resets_at)),
+                }),
+            },
+        }
+    }
+
+    #[test]
+    fn over_the_usage_cap_nothing_starts_until_the_reset() {
+        let mut store = Store::open_in_memory().unwrap();
+        reading(0.857, "2026-10-22T09:00:00Z", None)
+            .save(&mut store)
+            .unwrap();
+        let board = Board::load(&store, at("2026-10-19T22:41:00Z")).unwrap();
+        let text = board.render(&config(), &TimeZone::UTC);
+        assert!(
+            text.contains(
+                "Usage:    weekly 85% (resets Thu 22 Oct 09:00); cap 80%, read Mon 19 Oct 22:20\n\
+                 Claiming: the weekly Claude allowance is 85% used, over the 80% cap, \
+                 so nothing starts until Thu 22 Oct 09:02\n"
+            ),
+            "{text}"
+        );
+
+        // After the weekly reset the reading is out of date and stops nothing.
+        let board = Board::load(&store, at("2026-10-22T09:30:00Z")).unwrap();
+        let text = board.render(&config(), &TimeZone::UTC);
+        assert!(text.contains("weekly 85% (reset since); cap 80%"), "{text}");
+        assert!(text.contains("Claiming: allowed\n"), "{text}");
+    }
+
     #[test]
     fn an_idle_factory_outside_the_window() {
         let store = Store::open_in_memory().unwrap();
@@ -388,7 +480,10 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("Claiming: allowed\nLast tick: never"),
+            text.contains(
+                "Usage:    no reading yet; cap 80% of the weekly allowance\n\
+                 Claiming: allowed\nLast tick: never"
+            ),
             "{text}"
         );
         assert!(text.contains("\nReady (0)\n\nRunning (0)\n"), "{text}");

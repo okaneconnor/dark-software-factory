@@ -22,6 +22,10 @@ use crate::schedule::Window;
 /// person's reviewable output.
 pub const MAX_WORKERS: usize = 2;
 
+/// The agreed share of the weekly Claude allowance the factory may use,
+/// leaving the rest for the operator's own work.
+pub const DEFAULT_WEEKLY_USAGE_CAP: u8 = 80;
+
 /// Hosts every agent container needs, whatever the operator adds.
 pub const BUILTIN_EGRESS: &[&str] = &["api.anthropic.com"];
 
@@ -35,6 +39,9 @@ pub struct Config {
     pub digest_at: Time,
     /// How long a plan waits for approval before the run is blocked.
     pub approval_expiry: Duration,
+    /// Percent of the weekly allowance after which no agent stage starts
+    /// until it resets. 100 leaves it to the real limit.
+    pub weekly_usage_cap: u8,
     pub state_dir: PathBuf,
     pub allowlist: Allowlist,
     /// The GitHub App dsf acts as. Only `--local` runs work without one.
@@ -136,6 +143,7 @@ struct RawConfig {
     workers: Option<usize>,
     digest_at: Option<String>,
     approval_expiry: Option<String>,
+    weekly_usage_cap: Option<u8>,
     state_dir: Option<PathBuf>,
     window: Option<RawWindow>,
     github: RawGithub,
@@ -302,6 +310,12 @@ impl RawConfig {
             3 * DAY,
             (HOUR, 30 * DAY),
         );
+        let weekly_usage_cap = check.number(
+            "weekly_usage_cap",
+            self.weekly_usage_cap,
+            DEFAULT_WEEKLY_USAGE_CAP,
+            (1, 100),
+        );
 
         let state_dir = self
             .state_dir
@@ -419,6 +433,7 @@ impl RawConfig {
             window,
             digest_at,
             approval_expiry,
+            weekly_usage_cap,
             state_dir,
             allowlist,
             github_app_id: self.github.app_id,
@@ -512,6 +527,7 @@ mod tests {
         assert_eq!(config.window.start, jiff::civil::time(23, 0, 0, 0));
         assert_eq!(config.window.end, jiff::civil::time(7, 0, 0, 0));
         assert_eq!(config.approval_expiry, 3 * DAY);
+        assert_eq!(config.weekly_usage_cap, 80);
         assert_eq!(config.state_dir, PathBuf::from("/var/lib/dsf"));
         assert_eq!(config.caps, Caps::default());
         assert_eq!(config.egress, ["api.anthropic.com"]);
@@ -552,6 +568,20 @@ mod tests {
                 .workers,
             2
         );
+    }
+
+    #[test]
+    fn the_usage_cap_is_a_percentage() {
+        assert_eq!(
+            fields(&format!("weekly_usage_cap = 0\n{MINIMAL}")),
+            ["weekly_usage_cap"]
+        );
+        assert_eq!(
+            fields(&format!("weekly_usage_cap = 101\n{MINIMAL}")),
+            ["weekly_usage_cap"]
+        );
+        let config = Config::parse(&format!("weekly_usage_cap = 100\n{MINIMAL}")).unwrap();
+        assert_eq!(config.weekly_usage_cap, 100);
     }
 
     #[test]

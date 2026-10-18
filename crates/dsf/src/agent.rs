@@ -5,6 +5,7 @@
 use anyhow::{Result, ensure};
 use dsf_core::workflow::{AgentMode, Schema};
 use jiff::Timestamp;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub const READ_TOOLS: &str = "Read,Grep,Glob";
@@ -131,7 +132,7 @@ pub struct Completion {
 }
 
 /// Subscription usage, as last reported on the stream.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Usage {
     /// `allowed`, `allowed_warning` or `rejected`.
     pub status: String,
@@ -139,7 +140,7 @@ pub struct Usage {
     pub seven_day: Option<Window>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Window {
     /// The fraction of the window used, usually 0 to 1.
     pub utilization: f64,
@@ -181,7 +182,7 @@ pub fn summarise(stream: &str) -> Summary {
                     if AUTH_ERRORS.contains(&error) {
                         auth_failed = Some(error.to_owned());
                     } else if WAIT_ERRORS.contains(&error) && limited.is_none() {
-                        limited = Some((None, error.to_owned()));
+                        limited = Some((None, wait_detail(error)));
                     }
                 }
             }
@@ -240,8 +241,17 @@ fn reset_time(value: &Value) -> Option<Timestamp> {
 
 fn limit_detail(info: &Value) -> String {
     match info["rateLimitType"].as_str() {
-        Some(kind) => format!("usage limit reached ({kind})"),
-        None => "usage limit reached".to_owned(),
+        Some(kind) => format!("the Claude usage limit was reached ({kind})"),
+        None => "the Claude usage limit was reached".to_owned(),
+    }
+}
+
+fn wait_detail(error: &str) -> String {
+    match error {
+        "rate_limit" => "Claude is rate-limiting requests".to_owned(),
+        "overloaded" => "Claude is overloaded".to_owned(),
+        "server_error" => "Claude had a server error".to_owned(),
+        other => format!("Claude reported {other}"),
     }
 }
 
@@ -323,7 +333,7 @@ mod tests {
             summarise(stream).outcome,
             AgentOutcome::Limited {
                 resets_at: Some(Timestamp::from_second(1_792_800_000).unwrap()),
-                detail: "usage limit reached (five_hour)".into(),
+                detail: "the Claude usage limit was reached (five_hour)".into(),
             }
         );
     }
@@ -334,7 +344,7 @@ mod tests {
         let summary = summarise(stream);
         assert!(matches!(
             summary.outcome,
-            AgentOutcome::Limited { resets_at: Some(_), ref detail } if detail == "usage limit reached (seven_day)"
+            AgentOutcome::Limited { resets_at: Some(_), ref detail } if detail == "the Claude usage limit was reached (seven_day)"
         ));
         assert_eq!(summary.usage.unwrap().status, "rejected");
     }
@@ -347,7 +357,7 @@ mod tests {
             summarise(stream).outcome,
             AgentOutcome::Limited {
                 resets_at: None,
-                detail: "overloaded".into()
+                detail: "Claude is overloaded".into()
             }
         );
     }

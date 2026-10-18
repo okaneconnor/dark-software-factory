@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize};
 use crate::engine::RunEnd;
 use crate::factory::{Factory, Outcome};
 use crate::store::{self, RunStatus, SuspendReason};
+use crate::usage::UsageReading;
 
 /// `kv` key: why claiming is paused, if it is. Set by `dsf pause`, or by
 /// dsf itself when Claude stops accepting its token.
@@ -282,6 +283,8 @@ impl Scheduler {
     /// Whether another run may start now, with `active` already running.
     fn decision(&self, active: usize) -> Result<ClaimDecision> {
         let store = self.factory.engine().store()?;
+        let now = self.factory.now();
+        let config = self.factory.config();
         let state = ClaimState {
             paused: store.kv_get(PAUSED)?.is_some(),
             backoff_until: store
@@ -289,11 +292,12 @@ impl Scheduler {
                 .map(|text| text.parse::<Timestamp>())
                 .transpose()
                 .context("reading the stored backoff")?,
+            usage_capped_until: UsageReading::load(&store)?
+                .and_then(|reading| reading.capped_until(config.weekly_usage_cap, now)),
             active_runs: active,
         };
-        let config = self.factory.config();
         Ok(schedule::claim_decision(
-            self.factory.now(),
+            now,
             &self.tz,
             &config.window,
             config.workers,
@@ -317,6 +321,20 @@ impl Scheduler {
                 "backing off after a usage limit until {}",
                 local(until, &self.tz)
             ),
+            Wait::OverUsageCap { until } => {
+                let cap = self.factory.config().weekly_usage_cap;
+                let why = self
+                    .factory
+                    .engine()
+                    .store()
+                    .ok()
+                    .and_then(|store| UsageReading::load(&store).ok().flatten())
+                    .map_or_else(
+                        || format!("the weekly Claude allowance is over the {cap}% cap"),
+                        |reading| reading.over_cap(cap),
+                    );
+                format!("{why}, so nothing starts until {}", local(until, &self.tz))
+            }
             Wait::WindowClosed { opens_at } => format!(
                 "outside the window, which opens at {}",
                 local(opens_at, &self.tz)

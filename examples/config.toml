@@ -19,6 +19,11 @@ digest_at = "07:00"
 # How long a posted plan waits for factory:plan-approved before blocking.
 approval_expiry = "3d"
 
+# Percent of your weekly Claude allowance the factory may use. Past it, no
+# new Claude stage starts and paused runs carry on after the weekly reset,
+# leaving the rest for your own work. 100 leaves it to the real limit.
+weekly_usage_cap = 80
+
 state_dir = "/var/lib/dsf"
 
 [github]

@@ -14,7 +14,7 @@
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -40,6 +40,7 @@ use crate::sandbox::{
     self, ATTEMPT_LABEL, Bind, EnvValue, Limits, Network, RUN_LABEL, Sandbox, Spec,
 };
 use crate::store::{self, Advance, Attempt, AttemptEnd, NewRun, RunStatus, Store, SuspendReason};
+use crate::usage::UsageReading;
 
 /// `next_stage` value for a run that has finished its stages and only
 /// needs publishing.
@@ -48,6 +49,9 @@ const PUBLISH: &str = "@publish";
 /// Usage-limit hits in a row with no completed agent stage between them,
 /// which lengthen the backoff when the reset time isn't known.
 const LIMIT_HITS: &str = "usage_limit_hits";
+
+/// The time, from the system clock except in tests.
+pub type Clock = Arc<dyn Fn() -> Timestamp + Send + Sync>;
 
 /// How agent containers reach the internet.
 #[derive(Debug, Clone)]
@@ -71,6 +75,8 @@ pub struct Config {
     pub egress: Egress,
     pub caps: Caps,
     pub extra_protected: Vec<String>,
+    /// Percent of the weekly allowance after which no agent stage starts.
+    pub weekly_usage_cap: u8,
     pub claude_token: SecretString,
 }
 
@@ -183,6 +189,7 @@ pub struct Engine {
     /// `uid:gid` containers run as: the owner of the state directory.
     user: String,
     report: Box<dyn Fn(&str) + Send + Sync>,
+    clock: Clock,
 }
 
 /// A run in progress.
@@ -266,7 +273,18 @@ impl Engine {
             masker,
             user,
             report,
+            clock: Arc::new(Timestamp::now),
         })
+    }
+
+    /// Uses `clock`'s time rather than the system's, so tests can say when
+    /// "now" is.
+    pub fn set_clock(&mut self, clock: Clock) {
+        self.clock = clock;
+    }
+
+    pub fn now(&self) -> Timestamp {
+        (self.clock)()
     }
 
     #[must_use]
@@ -307,7 +325,7 @@ impl Engine {
             comments: &comments,
             require_approval: issue.require_approval,
         };
-        self.db()?.create_run(&new, Timestamp::now())
+        self.db()?.create_run(&new, self.now())
     }
 
     /// Runs a run made by [`Self::create_run`] from the beginning.
@@ -333,7 +351,7 @@ impl Engine {
     pub fn cancel(&self, run_id: i64, reason: &str) -> Result<()> {
         let reason = self.masker.mask(reason);
         self.db()?
-            .end_run(run_id, RunStatus::Canceled, &reason, Timestamp::now())?;
+            .end_run(run_id, RunStatus::Canceled, &reason, self.now())?;
         self.event(run_id, "canceled", &reason);
         Ok(())
     }
@@ -351,7 +369,7 @@ impl Engine {
         for run in unfinished.iter().filter(|r| r.status == RunStatus::Queued) {
             self.cancel(run.id, "dsf stopped before the run's first stage")?;
         }
-        self.db()?.interrupt_unfinished(None, Timestamp::now())?;
+        self.db()?.interrupt_unfinished(None, self.now())?;
         let mut interrupted = Vec::new();
         for run in unfinished.iter().filter(|r| r.status == RunStatus::Running) {
             let removed = self
@@ -386,7 +404,7 @@ impl Engine {
 
     pub fn set_approval_comment(&self, run_id: i64, comment_id: u64) -> Result<()> {
         self.db()?
-            .set_approval_comment(run_id, comment_id, Timestamp::now())
+            .set_approval_comment(run_id, comment_id, self.now())
     }
 
     /// Hides every secret dsf holds or has handed out.
@@ -421,8 +439,7 @@ impl Engine {
                 &format!("removed {removed} leftover container(s)"),
             );
         }
-        self.db()?
-            .interrupt_unfinished(Some(run_id), Timestamp::now())?;
+        self.db()?.interrupt_unfinished(Some(run_id), self.now())?;
         let stored = self.db()?.run(run_id)?;
         if !matches!(stored.status, RunStatus::Suspended | RunStatus::Queued) {
             bail!(
@@ -482,8 +499,7 @@ impl Engine {
                 if stored.suspend_reason == Some(SuspendReason::Interrupted) {
                     let next = progress.interrupted(&stage);
                     // Saved now, so repeated crashes are counted.
-                    self.db()?
-                        .set_progress(run_id, &progress, Timestamp::now())?;
+                    self.db()?.set_progress(run_id, &progress, self.now())?;
                     next
                 } else {
                     // The visit was counted when the stage was first entered.
@@ -514,8 +530,7 @@ impl Engine {
             }
             Err(GitError::Failed(error)) => return Err(error),
         };
-        self.db()?
-            .set_base(run_id, base.as_str(), Timestamp::now())?;
+        self.db()?.set_base(run_id, base.as_str(), self.now())?;
         let snapshot = dir.factory_snapshot();
         match repo.snapshot_factory(&base, &snapshot).await {
             Ok(()) => {}
@@ -590,7 +605,7 @@ impl Engine {
         }
         if let Some(source) = source {
             self.db()
-                .and_then(|mut db| db.set_workflow(run_id, &source, Timestamp::now()))
+                .and_then(|mut db| db.set_workflow(run_id, &source, self.now()))
                 .map_err(|e| e.to_string())?;
             self.event(
                 run_id,
@@ -625,13 +640,16 @@ impl Engine {
                     return self.block(run.id, &reason.to_string());
                 }
             };
+            if let Some(end) = self.pause_at_usage_cap(&run, &stage, &progress)? {
+                return Ok(end);
+            }
             let visit = progress.visits(&stage);
             let attempt = self.db()?.start_attempt(
                 run.id,
                 stage.as_str(),
                 visit,
                 Some(run.checkpoint.as_str()),
-                Timestamp::now(),
+                self.now(),
             )?;
             self.event(run.id, "stage", &format!("{stage} (visit {visit})"));
             let result = match self.run_stage(&mut run, &stage, visit, attempt).await {
@@ -643,6 +661,54 @@ impl Engine {
                 Step::Stop(end) => return Ok(end),
             };
         }
+    }
+
+    /// Suspends the run before an agent stage while the weekly allowance is
+    /// used past the cap, as a usage limit would. The reading is the last
+    /// one any run saw, so at most one stage overshoots the cap. The run
+    /// gets no resume time: claiming waits while the latest reading is over
+    /// the configured cap, so the weekly reset, or a higher cap, lets it
+    /// carry on.
+    fn pause_at_usage_cap(
+        &self,
+        run: &Run,
+        stage: &StageId,
+        progress: &Progress,
+    ) -> Result<Option<RunEnd>> {
+        let is_agent = run
+            .workflow
+            .stage(stage)
+            .is_some_and(|definition| matches!(definition.kind, StageKind::Agent { .. }));
+        if !is_agent {
+            return Ok(None);
+        }
+        let now = self.now();
+        let cap = self.config.weekly_usage_cap;
+        let Some(reading) = UsageReading::load(&*self.db()?)? else {
+            return Ok(None);
+        };
+        if reading.capped_until(cap, now).is_none() {
+            return Ok(None);
+        }
+        let mut detail = reading.over_cap(cap);
+        if let Some(reset) = reading.usage.seven_day.and_then(|weekly| weekly.resets_at) {
+            let _ = write!(detail, " until it resets at {reset}");
+        }
+        self.db()?.suspend_before(
+            run.id,
+            stage.as_str(),
+            progress,
+            SuspendReason::UsageLimit,
+            None,
+            now,
+        )?;
+        self.event(run.id, "suspended", &format!("before {stage}: {detail}"));
+        Ok(Some(RunEnd::Suspended {
+            run_id: run.id,
+            reason: SuspendReason::UsageLimit,
+            resume_after: None,
+            detail,
+        }))
     }
 
     /// Writes the stage boundary for an attempt's result, and says where
@@ -776,7 +842,7 @@ impl Engine {
             progress,
             Some(run.checkpoint.as_str()),
             advance,
-            Timestamp::now(),
+            self.now(),
         )
     }
 
@@ -865,11 +931,19 @@ impl Engine {
                 self.db()?.set_container(attempt, id)
             })
             .await?;
+        let agent::Summary { outcome, usage } = agent::summarise(&read_lossy(&stream_path));
+        if let Some(usage) = usage {
+            let reading = UsageReading {
+                seen_at: self.now(),
+                usage,
+            };
+            reading.save(&mut *self.db()?)?;
+        }
         let outcome = if finished.timed_out {
             let limit = dsf_core::duration::format(self.config.agent_timeout);
             AgentOutcome::Failed(format!("timed out after {limit}"))
         } else {
-            agent::summarise(&read_lossy(&stream_path)).outcome
+            outcome
         };
 
         match outcome {
@@ -896,7 +970,7 @@ impl Engine {
                 };
                 Ok(StageResult::Suspend {
                     reason: SuspendReason::UsageLimit,
-                    resume_after: Some(usage_limit_resume(Timestamp::now(), resets_at, hits)),
+                    resume_after: Some(usage_limit_resume(self.now(), resets_at, hits)),
                     detail,
                 })
             }
@@ -990,7 +1064,7 @@ impl Engine {
             match schema {
                 Some(Schema::Plan) => {
                     let plan = plan_text(output);
-                    self.db()?.set_plan(run.id, &plan, Timestamp::now())?;
+                    self.db()?.set_plan(run.id, &plan, self.now())?;
                     run.plan = Some(plan);
                 }
                 Some(Schema::Review) => {
@@ -1231,12 +1305,11 @@ impl Engine {
         };
         let mut reason = format!("pushed {branch} at {}", run.checkpoint);
         if let Some(pull_request) = &pull_request {
-            self.db()?
-                .set_pr(run.id, pull_request.number, Timestamp::now())?;
+            self.db()?.set_pr(run.id, pull_request.number, self.now())?;
             let _ = write!(reason, " and opened {}", pull_request.url);
         }
         self.db()?
-            .end_run(run.id, RunStatus::Published, &reason, Timestamp::now())?;
+            .end_run(run.id, RunStatus::Published, &reason, self.now())?;
         self.event(run.id, "published", &reason);
         Ok(RunEnd::Published {
             run_id: run.id,
@@ -1249,7 +1322,7 @@ impl Engine {
     fn publish_failed(&self, run_id: i64, reason: &str) -> Result<RunEnd> {
         let reason = self.masker.mask(reason);
         self.db()?
-            .end_run(run_id, RunStatus::PublishFailed, &reason, Timestamp::now())?;
+            .end_run(run_id, RunStatus::PublishFailed, &reason, self.now())?;
         self.event(run_id, "publish_failed", &reason);
         Ok(RunEnd::PublishFailed { run_id, reason })
     }
@@ -1273,7 +1346,7 @@ impl Engine {
     pub fn block(&self, run_id: i64, reason: &str) -> Result<RunEnd> {
         let reason = self.masker.mask(reason);
         self.db()?
-            .end_run(run_id, RunStatus::Blocked, &reason, Timestamp::now())?;
+            .end_run(run_id, RunStatus::Blocked, &reason, self.now())?;
         self.event(run_id, "blocked", &reason);
         Ok(RunEnd::Blocked { run_id, reason })
     }
@@ -1343,7 +1416,7 @@ impl Engine {
     fn event(&self, run_id: i64, kind: &str, message: &str) {
         let message = self.masker.mask(message);
         if let Ok(mut db) = self.db() {
-            let _ = db.event(Some(run_id), kind, &message, Timestamp::now());
+            let _ = db.event(Some(run_id), kind, &message, self.now());
         }
         (self.report)(&format!("run {run_id}: {message}"));
     }
