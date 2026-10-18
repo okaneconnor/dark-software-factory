@@ -15,6 +15,12 @@ The change was made for GitHub issue #7 in octocat/calc:
 fake-implement: fix-calc
 </issue>
 
+Comments on the issue from maintainers, oldest first (older ones left out: 1):
+
+<comment author="octocat">
+Integers only, please.
+</comment>
+
 The plan it follows:
 
 <plan>

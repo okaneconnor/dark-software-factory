@@ -18,11 +18,14 @@ bollard = "0.21.1"
 clap = { version = "4.6.7", features = ["derive"] }
 dsf-core = { path = "../dsf-core" }
 futures-util = "0.3.34"
-jiff = "0.2.38"
+jiff = { version = "0.2.38", features = ["serde"] }
 minijinja = { version = "3.0.1", features = ["serde", "fuel"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "json", "query"] }
+ring = "0.17.14"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 rusqlite_migration = "2.6.0"
-secrecy = "0.10.3"
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+secrecy = { version = "0.10.3", features = ["serde"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 thiserror = "2.0.21"
@@ -32,3 +35,4 @@ tokio = { version = "1.53.3", features = ["macros", "rt-multi-thread", "process"
 assert_cmd = "2.2.2"
 insta = "1.49.0"
 tempfile = "3.27.0"
+wiremock = "0.6.5"

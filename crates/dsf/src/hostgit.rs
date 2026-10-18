@@ -193,6 +193,11 @@ impl Auth {
         Self { token }
     }
 
+    /// The token and the header carrying it: what the masker must hide.
+    pub fn secrets(&self) -> [SecretString; 2] {
+        [self.token.clone(), self.header_value()]
+    }
+
     /// The `Authorization` header value, which the masker must also hide.
     pub fn header_value(&self) -> SecretString {
         let basic = base64::engine::general_purpose::STANDARD

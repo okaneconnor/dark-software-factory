@@ -6,7 +6,13 @@ You are fixing a change in the repository in your working directory. It was made
 
 {{ issue.body }}
 </issue>
-
+{% if issue.comments %}
+Comments on the issue from maintainers, oldest first{% if issue.omitted_comments %} (older ones left out: {{ issue.omitted_comments }}){% endif %}:
+{% for comment in issue.comments %}
+<comment author="{{ comment.author }}">
+{{ comment.body }}
+</comment>
+{% endfor %}{% endif %}
 The plan it follows:
 
 <plan>

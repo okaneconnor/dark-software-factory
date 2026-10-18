@@ -2,9 +2,15 @@
 // allow-unwrap-in-tests, and a failed precondition should panic here.
 #![allow(clippy::unwrap_used)]
 
+mod support;
+
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 use assert_cmd::Command;
+use serde_json::json;
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn dsf() -> Command {
     Command::cargo_bin("dsf").unwrap()
@@ -156,6 +162,118 @@ fn missing_files_name_the_path() {
     let stderr = stderr(dsf().args(["workflow", "validate", "/nonexistent/workflow.toml"]));
     assert!(
         stderr.starts_with("error: reading /nonexistent/workflow.toml"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn run_takes_an_issue_as_owner_repo_number() {
+    for (args, expected) in [
+        (&["run", "octo"][..], "`octo` is not owner/repo#N"),
+        (&["run", "octo/calc#0"], "`0` is not an issue number"),
+        (&["run", "octo/calc#x"], "`x` is not an issue number"),
+        (&["run", "not a repo#1"], "`not a repo` is not owner/name"),
+        (
+            &["run", "octo/calc#1", "--local", "."],
+            "cannot be used with",
+        ),
+        (&["run"], "required"),
+    ] {
+        let stderr = stderr(dsf().args(args));
+        assert!(stderr.contains(expected), "{args:?}: {stderr}");
+    }
+}
+
+/// A config for octo/calc and a GitHub App key, as an operator has them.
+fn github_setup(dir: &std::path::Path) -> (PathBuf, PathBuf) {
+    let config = dir.join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            r#"
+            timezone = "Europe/London"
+            state_dir = "{}"
+            [github]
+            allowed_users = ["alice"]
+            app_id = 1
+            [[repos]]
+            name = "octo/calc"
+            [images]
+            worker = "dsf-worker:dev"
+            "#,
+            dir.join("state").display()
+        ),
+    )
+    .unwrap();
+    let key = dir.join("app.pem");
+    std::fs::write(&key, support::app_key_pem()).unwrap();
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+    (config, key)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn labels_init_creates_the_labels_as_the_app() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/octo/calc/installation"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": 7 })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/app/installations/7/access_tokens"))
+        .respond_with(
+            ResponseTemplate::new(201).set_body_json(
+                json!({ "token": "ghs_test", "expires_at": "2099-01-01T00:00:00Z" }),
+            ),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/octo/calc/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/octo/calc/labels"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({})))
+        .expect(8)
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let (config, key) = github_setup(dir.path());
+    let api = server.uri();
+    let output = tokio::task::spawn_blocking(move || {
+        stdout(
+            dsf()
+                .args(["labels", "init", "OCTO/calc", "--config"])
+                .arg(&config)
+                .arg("--github-key")
+                .arg(&key)
+                .args(["--github-api", &api]),
+        )
+    })
+    .await
+    .unwrap();
+    assert!(
+        output.starts_with("octo/calc:\n  created   factory:draft\n"),
+        "{output}"
+    );
+    assert_eq!(output.lines().count(), 9);
+}
+
+#[test]
+fn labels_init_only_touches_configured_repos() {
+    let dir = tempfile::tempdir().unwrap();
+    let (config, key) = github_setup(dir.path());
+    let stderr = stderr(
+        dsf()
+            .args(["labels", "init", "octo/other", "--config"])
+            .arg(&config)
+            .arg("--github-key")
+            .arg(&key),
+    );
+    assert!(
+        stderr.contains("octo/other is not one of the configured repos"),
         "{stderr}"
     );
 }

@@ -8,7 +8,13 @@ The task is GitHub issue #{{ issue.number }} in {{ issue.repo }}, written by a m
 
 {{ issue.body }}
 </issue>
-
+{% if issue.comments %}
+Comments on the issue from maintainers, oldest first{% if issue.omitted_comments %} (older ones left out: {{ issue.omitted_comments }}){% endif %}:
+{% for comment in issue.comments %}
+<comment author="{{ comment.author }}">
+{{ comment.body }}
+</comment>
+{% endfor %}{% endif %}
 Explore the code until you understand what has to change, then return:
 
 - `outcome`: `ready` if the issue is clear enough to implement, or `needs_decision` if it is ambiguous, contradictory, or needs a choice only a maintainer can make.

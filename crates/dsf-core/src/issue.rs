@@ -3,6 +3,7 @@
 
 use std::collections::BTreeSet;
 
+use jiff::Timestamp;
 use serde::Deserialize;
 
 use crate::labels::{self, Lifecycle};
@@ -79,6 +80,50 @@ pub fn assess(candidate: &Candidate<'_>, allowlist: &Allowlist) -> Verdict {
         return Verdict::Skip(SkipReason::WaitingOn(candidate.open_blockers.to_vec()));
     }
     Verdict::Claim
+}
+
+/// A label added to or removed from an issue, from the issue events API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LabelEvent<'a> {
+    pub actor: &'a str,
+    pub label: &'a str,
+    pub added: bool,
+    pub at: Timestamp,
+}
+
+/// Who most recently added `factory:ready`, ignoring `own_login`, dsf's
+/// own bot. dsf re-adds the label itself when a usage limit pauses a run;
+/// that requeue must neither count as trust nor hide the human who gave
+/// it. `events` are oldest first, as the API returns them.
+pub fn ready_labeller<'a>(events: &[LabelEvent<'a>], own_login: &str) -> Option<&'a str> {
+    events
+        .iter()
+        .rev()
+        .filter(|event| event.added && event.label.eq_ignore_ascii_case(labels::READY.name))
+        .find(|event| !event.actor.eq_ignore_ascii_case(own_login))
+        .map(|event| event.actor)
+}
+
+/// Who approved a plan posted at `posted`: a trusted user who added
+/// `factory:plan-approved` at or after that time. Approvals from before
+/// the plan existed, or from anyone else, don't count. The caller also
+/// checks the label is still on the issue, so removing it withdraws the
+/// approval.
+pub fn plan_approver<'a>(
+    events: &[LabelEvent<'a>],
+    posted: Timestamp,
+    allowlist: &Allowlist,
+) -> Option<&'a str> {
+    events
+        .iter()
+        .rev()
+        .filter(|event| {
+            event.added
+                && event.at >= posted
+                && event.label.eq_ignore_ascii_case(labels::PLAN_APPROVED.name)
+        })
+        .find(|event| allowlist.contains(event.actor))
+        .map(|event| event.actor)
 }
 
 /// When a run stops for a human to approve its plan.
@@ -237,6 +282,55 @@ mod tests {
             assess(&candidate(&labels, &[4, 9]), &allowlist),
             Verdict::Skip(SkipReason::WaitingOn(vec![4, 9]))
         );
+    }
+
+    fn event(
+        actor: &'static str,
+        label: &'static str,
+        added: bool,
+        at: i64,
+    ) -> LabelEvent<'static> {
+        LabelEvent {
+            actor,
+            label,
+            added,
+            at: Timestamp::from_second(at).unwrap(),
+        }
+    }
+
+    #[test]
+    fn the_ready_labeller_is_the_latest_human_to_add_it() {
+        let events = [
+            event("alice", "factory:ready", true, 1),
+            event("dsf[bot]", "factory:ready", false, 2),
+            event("dsf[bot]", "factory:running", true, 2),
+            // A usage limit: dsf puts the issue back in the queue.
+            event("dsf[bot]", "factory:running", false, 3),
+            event("dsf[bot]", "Factory:Ready", true, 3),
+        ];
+        assert_eq!(ready_labeller(&events, "DSF[bot]"), Some("alice"));
+        let mut later = events.to_vec();
+        later.push(event("mallory", "factory:ready", true, 4));
+        assert_eq!(ready_labeller(&later, "dsf[bot]"), Some("mallory"));
+        assert_eq!(ready_labeller(&events[1..], "dsf[bot]"), None);
+        assert_eq!(ready_labeller(&[], "dsf[bot]"), None);
+    }
+
+    #[test]
+    fn only_a_trusted_approval_after_the_plan_counts() {
+        let allowlist = Allowlist::new(["alice"]);
+        let posted = Timestamp::from_second(100).unwrap();
+        let stale = [event("alice", "factory:plan-approved", true, 99)];
+        assert_eq!(plan_approver(&stale, posted, &allowlist), None);
+        let untrusted = [event("mallory", "factory:plan-approved", true, 101)];
+        assert_eq!(plan_approver(&untrusted, posted, &allowlist), None);
+        let removed = [event("alice", "factory:plan-approved", false, 101)];
+        assert_eq!(plan_approver(&removed, posted, &allowlist), None);
+        let approved = [
+            event("mallory", "factory:plan-approved", true, 100),
+            event("Alice", "factory:plan-approved", true, 100),
+        ];
+        assert_eq!(plan_approver(&approved, posted, &allowlist), Some("Alice"));
     }
 
     #[test]

@@ -15,6 +15,12 @@ The task is GitHub issue #7 in octocat/calc, written by a maintainer:
 fake-implement: fix-calc
 </issue>
 
+Comments on the issue from maintainers, oldest first (older ones left out: 1):
+
+<comment author="octocat">
+Integers only, please.
+</comment>
+
 Explore the code until you understand what has to change, then return:
 
 - `outcome`: `ready` if the issue is clear enough to implement, or `needs_decision` if it is ambiguous, contradictory, or needs a choice only a maintainer can make.

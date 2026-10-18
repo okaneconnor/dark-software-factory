@@ -8,7 +8,7 @@ use std::path::Path;
 use anyhow::{Context as _, Result, bail};
 use minijinja::value::{Serde, Value};
 use minijinja::{AutoEscape, Environment, UndefinedBehavior};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 const DEFAULTS: [(&str, &str); 4] = [
     (
@@ -37,6 +37,9 @@ const FUEL: u64 = 100_000;
 pub const MAX_BODY_BYTES: usize = 24 * 1024;
 pub const MAX_DIFF_BYTES: usize = 60 * 1024;
 pub const MAX_OUTPUT_BYTES: usize = 12 * 1024;
+/// All comments together, then each one.
+pub const MAX_COMMENTS_BYTES: usize = 16 * 1024;
+const MAX_COMMENT_BYTES: usize = 4 * 1024;
 
 pub struct Prompts {
     env: Environment<'static>,
@@ -60,6 +63,17 @@ pub struct Issue<'a> {
     pub repo: &'a str,
     pub number: u64,
     pub title: &'a str,
+    pub body: String,
+    /// The latest comments that fit, oldest first.
+    pub comments: Vec<Comment>,
+    /// How many earlier comments didn't fit.
+    pub omitted_comments: usize,
+}
+
+/// A comment on the issue from a trusted user.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Comment {
+    pub author: String,
     pub body: String,
 }
 
@@ -112,6 +126,28 @@ impl Prompts {
     }
 }
 
+/// The most recent comments that fit [`MAX_COMMENTS_BYTES`], oldest first,
+/// each cut to a sensible length, and how many were left out.
+pub fn fit_comments(comments: &[Comment]) -> (Vec<Comment>, usize) {
+    let mut kept = Vec::new();
+    let mut used = 0;
+    for comment in comments.iter().rev() {
+        let body = head(&comment.body, MAX_COMMENT_BYTES);
+        let size = comment.author.len() + body.len();
+        if used + size > MAX_COMMENTS_BYTES {
+            break;
+        }
+        used += size;
+        kept.push(Comment {
+            author: comment.author.clone(),
+            body,
+        });
+    }
+    let omitted = comments.len() - kept.len();
+    kept.reverse();
+    (kept, omitted)
+}
+
 /// The start of `text`, cut at a character boundary, with a note if cut.
 pub fn head(text: &str, max_bytes: usize) -> String {
     if text.len() <= max_bytes {
@@ -153,6 +189,11 @@ mod tests {
                 number: 7,
                 title: "add() subtracts",
                 body: "`add(2, 3)` returns -1.\n\nfake-implement: fix-calc".into(),
+                comments: vec![Comment {
+                    author: "octocat".into(),
+                    body: "Integers only, please.".into(),
+                }],
+                omitted_comments: 1,
             },
             plan: Some("Change `a - b` to `a + b` in calc.py."),
             protected,
@@ -241,6 +282,38 @@ mod tests {
                 .render("deploy.md.j2", &context(&protected))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn without_comments_the_section_disappears() {
+        let prompts = Prompts::new(BTreeMap::new()).unwrap();
+        let protected = protected();
+        let mut quiet = context(&protected);
+        quiet.issue.comments.clear();
+        quiet.issue.omitted_comments = 0;
+        let rendered = prompts.render("plan.md.j2", &quiet).unwrap();
+        assert!(!rendered.contains("<comment"));
+        assert!(rendered.contains("</issue>\n\nExplore the code"));
+    }
+
+    #[test]
+    fn keeps_the_latest_comments_that_fit() {
+        let comment = |n: usize| Comment {
+            author: format!("user{n}"),
+            body: "x".repeat(3000),
+        };
+        let comments: Vec<Comment> = (0..10).map(comment).collect();
+        let (kept, omitted) = fit_comments(&comments);
+        assert_eq!(kept.len() + omitted, 10);
+        assert!(omitted > 0);
+        assert_eq!(kept.last().unwrap().author, "user9");
+        let huge = [Comment {
+            author: "a".into(),
+            body: "y".repeat(100_000),
+        }];
+        let (kept, omitted) = fit_comments(&huge);
+        assert_eq!(omitted, 0);
+        assert!(kept[0].body.len() < 5000);
     }
 
     #[test]

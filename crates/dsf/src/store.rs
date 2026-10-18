@@ -83,8 +83,15 @@ ALTER TABLE runs ADD COLUMN clone_url TEXT NOT NULL DEFAULT '';
 ALTER TABLE runs ADD COLUMN publish_url TEXT NOT NULL DEFAULT '';
 ";
 
+/// What a run was told at claim time beyond the issue itself: the trusted
+/// comments, as JSON, and whether its plan needs a human's approval.
+const SCHEMA_V3: &str = "
+ALTER TABLE runs ADD COLUMN issue_comments TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE runs ADD COLUMN require_approval INTEGER NOT NULL DEFAULT 0;
+";
+
 fn migrations() -> Migrations<'static> {
-    Migrations::new(vec![M::up(SCHEMA_V1), M::up(SCHEMA_V2)])
+    Migrations::new(vec![M::up(SCHEMA_V1), M::up(SCHEMA_V2), M::up(SCHEMA_V3)])
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,6 +186,9 @@ pub struct NewRun<'a> {
     pub workflow: &'a str,
     pub clone_url: &'a str,
     pub publish_url: &'a str,
+    /// JSON: the trusted comments the prompts include.
+    pub comments: &'a str,
+    pub require_approval: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -202,6 +212,10 @@ pub struct Run {
     pub pr_number: Option<u64>,
     pub clone_url: String,
     pub publish_url: String,
+    pub issue_comments: String,
+    pub require_approval: bool,
+    /// The comment that posted the plan for approval.
+    pub approval_comment_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -287,8 +301,9 @@ impl Store {
         let now = now.to_string();
         let inserted = self.conn.execute(
             "INSERT INTO runs (repo, issue, status, progress, workflow, issue_title, issue_body,
-                               issue_author, issue_updated_at, created_at, updated_at, clone_url, publish_url)
-             VALUES (?1, ?2, 'queued', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10, ?11)",
+                               issue_author, issue_updated_at, created_at, updated_at, clone_url, publish_url,
+                               issue_comments, require_approval)
+             VALUES (?1, ?2, 'queued', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10, ?11, ?12, ?13)",
             params![
                 new.repo,
                 i64::try_from(new.issue)?,
@@ -300,7 +315,9 @@ impl Store {
                 new.updated_at,
                 now,
                 new.clone_url,
-                new.publish_url
+                new.publish_url,
+                new.comments,
+                new.require_approval
             ],
         );
         match inserted {
@@ -320,6 +337,33 @@ impl Store {
             .optional()?
             .with_context(|| format!("run {id} not found"))?
             .parse()
+    }
+
+    /// The issue's unfinished run, if it has one.
+    pub fn active_run(&self, repo: &str, issue: u64) -> Result<Option<Run>> {
+        self.conn
+            .query_row(
+                "SELECT * FROM runs WHERE repo = ?1 AND issue = ?2
+                 AND status IN ('queued', 'running', 'suspended')",
+                params![repo, i64::try_from(issue)?],
+                RunRow::read,
+            )
+            .optional()?
+            .map(RunRow::parse)
+            .transpose()
+    }
+
+    pub fn set_approval_comment(
+        &mut self,
+        run_id: i64,
+        comment_id: u64,
+        now: Timestamp,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE runs SET approval_comment_id = ?2, updated_at = ?3 WHERE id = ?1",
+            params![run_id, i64::try_from(comment_id)?, now.to_string()],
+        )?;
+        Ok(())
     }
 
     /// Records the commit a run starts from. It is also the first checkpoint.
@@ -613,6 +657,9 @@ struct RunRow {
     pr_number: Option<i64>,
     clone_url: String,
     publish_url: String,
+    issue_comments: String,
+    require_approval: bool,
+    approval_comment_id: Option<i64>,
 }
 
 impl RunRow {
@@ -637,6 +684,9 @@ impl RunRow {
             pr_number: row.get("pr_number")?,
             clone_url: row.get("clone_url")?,
             publish_url: row.get("publish_url")?,
+            issue_comments: row.get("issue_comments")?,
+            require_approval: row.get("require_approval")?,
+            approval_comment_id: row.get("approval_comment_id")?,
         })
     }
 
@@ -661,6 +711,9 @@ impl RunRow {
             pr_number: self.pr_number.map(u64::try_from).transpose()?,
             clone_url: self.clone_url,
             publish_url: self.publish_url,
+            issue_comments: self.issue_comments,
+            require_approval: self.require_approval,
+            approval_comment_id: self.approval_comment_id.map(u64::try_from).transpose()?,
         })
     }
 }
@@ -685,6 +738,8 @@ mod tests {
             workflow: dsf_core::workflow::DEFAULT_TOML,
             clone_url: "https://github.com/octocat/hello.git",
             publish_url: "https://github.com/octocat/hello.git",
+            comments: "[]",
+            require_approval: false,
         }
     }
 
@@ -704,6 +759,30 @@ mod tests {
             .end_run(first, RunStatus::Blocked, "needs a decision", now())
             .unwrap();
         assert!(store.create_run(&issue(1), now()).unwrap().is_some());
+    }
+
+    #[test]
+    fn finds_an_issues_active_run_with_its_claim_details() {
+        let mut store = Store::open_in_memory().unwrap();
+        assert_eq!(store.active_run("octocat/hello", 1).unwrap(), None);
+        let comments = r#"[{"author":"octocat","body":"Integers only."}]"#;
+        let new = NewRun {
+            comments,
+            require_approval: true,
+            ..issue(1)
+        };
+        let id = store.create_run(&new, now()).unwrap().unwrap();
+        store.set_approval_comment(id, 991, now()).unwrap();
+        let run = store.active_run("octocat/hello", 1).unwrap().unwrap();
+        assert_eq!(run.id, id);
+        assert_eq!(run.issue_comments, comments);
+        assert!(run.require_approval);
+        assert_eq!(run.approval_comment_id, Some(991));
+        assert_eq!(store.active_run("octocat/hello", 2).unwrap(), None);
+        store
+            .end_run(id, RunStatus::Canceled, "issue changed", now())
+            .unwrap();
+        assert_eq!(store.active_run("octocat/hello", 1).unwrap(), None);
     }
 
     #[test]

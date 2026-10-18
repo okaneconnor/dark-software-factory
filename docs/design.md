@@ -17,6 +17,7 @@ dsf is deliberately small and single-user. The reference design is [Fabro](https
 | Agent | Claude Code headless (`claude -p`), authenticated with `CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token` (subscription usage, not API keys). |
 | Isolation | Every stage runs in a hardened, throwaway Docker container on a dedicated host. |
 | Credentials | **The agent never holds a GitHub credential.** The host clones, commits and pushes. |
+| GitHub identity | A private **GitHub App**, installed only on the configured repos. dsf mints installation tokens that last an hour, each narrowed to one repository and the permissions one step needs, so there is no long-lived token to rotate and everything dsf does shows as its `[bot]` account. |
 | Done | The target repo's `.factory/verify.sh` exits 0. Failures feed a bounded fix loop. |
 | Limits | A usage-limit hit requeues the issue and pauses claiming until the limit resets. |
 | Schedule | Claims only inside a configurable window (default 23:00–07:00 local wall-clock time; it may span midnight, and equal start and end mean always open); running work finishes. One worker by default, maximum two. |
@@ -145,6 +146,8 @@ Resuming a run always removes any container still labelled with the run, then re
 
 A unique index on `(repo, issue)` over non-terminal runs prevents double claims. Resumed runs still respect the window.
 
+**Claiming.** Issue listings can be stale, so every decision starts from a fresh read of the issue and its label history, never from a list. dsf records the run first (the unique index), then removes `factory:ready`. Removing a label that is already gone fails with 404, so exactly one claimant succeeds; a loser cancels its run and touches nothing else. Only then does dsf add `factory:running`. When the run ends, dsf moves the issue to its new lifecycle label and comments: the draft PR's link, the reason it stopped, or when it will continue.
+
 An issue carries exactly one lifecycle label: `draft`, `ready`, `running`, `awaiting-approval`, `review` or `blocked`, each prefixed `factory:`. An issue with more than one is left alone until a human tidies it. Claiming also removes any leftover `factory:plan-approved`, so it can't approve the new run's plan.
 
 ## 6. Security model
@@ -169,7 +172,7 @@ The controls below are what make dsf safe to leave running unattended. [`CLAUDE.
    - Before `git add`, the worktree is walked without following symlinks, and any `.git` below the top level is refused, because adding a nested repository makes git read its files. The top-level `.git` is only the empty mount point; host git never looks at it.
    - Tests plant a config, filter driver and hooks in a worktree `.git`, check that plain git springs them, and check that `HostGit` never does.
    - Diffs are computed between recorded SHAs (`base_sha`, `checkpoint_sha`), never against refs the agent could influence. Verify runs against a clean export of the checkpoint commit (written through a private index, so the run's own index is untouched), with `.factory/` replaced by the base snapshot. It therefore checks exactly what would be published, not whatever else is lying in the worktree.
-   - Pushes use an explicit URL and `<sha>:refs/heads/factory/issue-<n>`. Authentication is a URL-scoped `http.extraheader` passed through `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_*` environment variables, so the token is never written to disk.
+   - Pushes use an explicit URL and `<sha>:refs/heads/factory/issue-<n>`. Authentication is an installation token for that one repository (§6.8), sent as a URL-scoped `http.extraheader` passed through `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_*` environment variables, so it is never written to disk.
 2. **No symlink following.** The host never follows symlinks in a worktree. Agent outputs are read from Claude's stream-json result or from git objects (`git cat-file`). Trees containing gitlinks, `.gitmodules` or symlinks that escape the repo are refused.
 3. **Protected paths.** After **every** agent stage, the change since `base_sha` is checked against `.factory/`, `.github/`, `.claude/`, `.mcp.json` and any operator additions. An entry covers the path itself and everything beneath it, ignoring ASCII case. A violation is deterministic and blocks the run immediately. The `.factory/` snapshot that command stages run is extracted from git objects at `base_sha`, and a snapshot containing a symlink is refused: one could point at a file the agent is free to edit.
 4. **Hardened containers.**
@@ -190,8 +193,17 @@ The controls below are what make dsf safe to leave running unattended. [`CLAUDE.
    - Before any push, the exact diff is scanned for literal secret values.
 7. **Trusted input only.**
    - dsf acts only on configured repos, and only on issues whose author **and** the user who applied `factory:ready` are on the operator allowlist, verified through the issue events API. Logins are compared case-insensitively, as GitHub does. This matters because repos, including this one, may be public.
-   - Only allowlisted users' comments are included in prompts.
+   - The labeller is the latest *person* to add `factory:ready`. dsf's own bot re-adds the label when a usage limit requeues an issue; that must neither count as trust nor hide who gave it.
+   - Only allowlisted users' comments are included in prompts, newest first up to 16 KiB. Everyone else's, and dsf's own, never reach an agent.
+   - Plan approval counts only if an allowlisted user added `factory:plan-approved` at or after the plan comment was posted, and the label is still there.
    - If the issue body changes after claiming, the run re-plans.
+
+8. **GitHub App credentials.**
+   - The app's private key is dsf's only long-lived GitHub secret. It stays on the host, as a systemd credential or a file only its owner can read (dsf refuses one that others can), and it only ever signs JWTs that last nine minutes.
+   - Every API call and git operation uses an installation token that lasts an hour and is narrowed to one repository and one step's permissions: `issues: write` to read, label and comment on issues; `contents: read` to clone; `contents: write` and `pull_requests: write` to push the branch and open its PR. Claiming an issue can't push code, and publishing can't reach another repository.
+   - Tokens are added to the masker as they are minted, together with the header that carries them.
+   - The app has no `workflows` permission, so GitHub itself refuses a push that touches `.github/workflows/`, behind dsf's own protected-path check.
+   - The API client never follows redirects, and pagination never follows a `Link` outside the API, so a token can't be sent anywhere else.
 
 **Accepted residual risks:**
 
@@ -206,14 +218,20 @@ The controls below are what make dsf safe to leave running unattended. [`CLAUDE.
 - **Configuration.** A single file, conventionally `/etc/dsf/config.toml`. [`examples/config.toml`](../examples/config.toml) documents every key with placeholder values, and `dsf config validate` checks a file. It sets:
   - the time zone, window (default 23:00–07:00), digest time (07:00), poll interval (5 minutes) and worker count (1 or 2);
   - repos and per-repo approval policy (`never`, `label` or `always`; default `label`);
-  - the user allowlist;
+  - the user allowlist, and the GitHub App's ID;
   - caps;
   - extra egress hosts (the Anthropic API is always allowed);
   - the worker image;
   - extra protected paths;
   - the state directory, and how long a plan waits for approval (default 3 days).
 
-  Unknown keys are errors, so a secret pasted into the wrong place is rejected rather than silently kept. Secrets come from systemd credentials or an environment file.
+  Unknown keys are errors, so a secret pasted into the wrong place is rejected rather than silently kept. Secrets are files: under systemd, `$CREDENTIALS_DIRECTORY/claude-oauth-token` and `$CREDENTIALS_DIRECTORY/github-app.pem`; otherwise the same names in `~/.config/dsf/`.
+
+- **Setting up the GitHub App.** Once per operator:
+  1. Create a GitHub App (Settings → Developer settings → GitHub Apps) with webhooks off, installable only on your account, and repository permissions Contents, Issues and Pull requests set to read and write. Nothing else; in particular, not Workflows.
+  2. Install it with *Only select repositories*, choosing exactly the configured repos.
+  3. Generate a private key, save it as `github-app.pem` with mode 600, and put the App ID in the config's `github.app_id`.
+  4. Run `dsf labels init owner/repo` for each repo, which also checks the app is installed there.
 
 ## 8. Repo layout and stack
 

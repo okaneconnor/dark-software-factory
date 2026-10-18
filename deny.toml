@@ -11,6 +11,13 @@ ignore = []
 # single static binary. Add to this list deliberately, never to get CI green.
 allow = [
     "Apache-2.0",
+    # subtle (constant-time helpers), via rustls.
+    "BSD-3-Clause",
+    # webpki-root-certs: Mozilla's root certificates as data, the platform
+    # verifier's fallback.
+    "CDLA-Permissive-2.0",
+    # ring and rustls-webpki: TLS to GitHub, and signing the App's JWTs.
+    "ISC",
     "MIT",
     "Unicode-3.0",
     # foldhash, via the SQLite crates' hash tables.
