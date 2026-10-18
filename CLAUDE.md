@@ -18,7 +18,7 @@ The toolchain is pinned in `rust-toolchain.toml`.
 ## Layout
 
 - `crates/dsf-core` is the pure domain model: config, workflows, routing, labels and scheduling rules. **No IO** of any kind: no `std::fs`, `std::process`, network, async runtime or clock reads. Pass time and data in as arguments. This keeps the logic that decides what the factory does deterministic and exhaustively testable. `crates/dsf-core/clippy.toml` turns the usual IO entry points into lint errors, and `crates/dsf/tests/core_purity.rs` allowlists its dependencies.
-- `crates/dsf` is the binary, and owns every side effect: git, Docker, GitHub, storage, scheduling, the web board. Scheduling decisions take the time from the factory's clock rather than reading it directly, so tests can control it.
+- `crates/dsf` is the binary, and owns every side effect: git, Docker, GitHub, storage, scheduling, the web board. Scheduling decisions and the engine's records take the time from the engine's clock (`Engine::now`) rather than reading it directly, so tests can control it.
 
 ## Code rules
 

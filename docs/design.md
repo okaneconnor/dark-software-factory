@@ -19,7 +19,7 @@ dsf is deliberately small and single-user. The reference design is [Fabro](https
 | Credentials | **The agent never holds a GitHub credential.** The host clones, commits and pushes. |
 | GitHub identity | A private **GitHub App**, installed only on the configured repos. dsf mints installation tokens that last an hour, each narrowed to one repository and the permissions one step needs, so there is no long-lived token to rotate and everything dsf does shows as its `[bot]` account. |
 | Done | The target repo's `.factory/verify.sh` exits 0. Failures feed a bounded fix loop. |
-| Limits | A usage-limit hit requeues the issue and pauses claiming until the limit resets. |
+| Limits | A usage-limit hit requeues the issue and pauses claiming until the limit resets. So does reaching the weekly usage cap (default 80% of the weekly allowance), which leaves the rest for the operator's own use. |
 | Schedule | Claims only inside a configurable window (default 23:00–07:00 local wall-clock time; it may span midnight, and equal start and end mean always open); running work finishes. A systemd timer runs `dsf tick` every few minutes; there is no long-running daemon. One worker by default, maximum two. |
 | Reporting | A morning digest (default 07:00) to a Microsoft Teams Workflows webhook, or to stdout. |
 | v1 scope | Staged pipeline, per-repo workflows, optional plan-approval gate, read-only web runs board. |
@@ -141,7 +141,7 @@ State lives in SQLite as plain rows, updated in one transaction at each stage bo
 | `runs` | Status, suspend reason, `resume_after`, next stage, visit counts, `base_sha`, `checkpoint_sha`, the workflow snapshot and hash, an issue snapshot (title, body, author, `updated_at`), the plan, the approval comment id, the last failure signature, the PR number |
 | `stage_attempts` | One row per stage attempt: visit number, status, outcome, failure class, container id, before and after SHAs, exit code, usage, structured output |
 | `events` | A human-readable timeline for the board and digest. Not the source of truth. |
-| `kv` | Factory-wide state: whether claiming is paused and why, `backoff_until`, consecutive usage-limit hits, and the last tick's record (the queue it saw and what it did) for `dsf status` and the board |
+| `kv` | Factory-wide state: whether claiming is paused and why, `backoff_until`, consecutive usage-limit hits, the latest usage reading, and the last tick's record (the queue it saw and what it did) for `dsf status` and the board |
 
 A run moves `queued → running → suspended{approval | usage_limit | interrupted} → queued → …`. It ends in one of `published`, `blocked`, `publish_failed` or `canceled`.
 
@@ -149,6 +149,7 @@ Resuming a run always removes any container still labelled with the run, then re
 
 - **Crash or restart.** Every tick starts by recovering. Attempts left running are marked `interrupted`, their runs suspended and their containers removed, so an orphaned agent can't carry on unseen; a run that stopped before its first stage has nothing to continue and is canceled. An interrupted run whose issue still reads `factory:running` carries on at the next tick inside the window, re-running the interrupted stage. An interruption does not consume a visit, but two in a row block the run. The interruption count is saved before the stage re-runs, so repeated crashes are counted. Tests kill `dsf run` with SIGKILL mid-stage and resume it, and drop a tick mid-stage and let the next tick carry on.
 - **Usage limit.** Detected from the stream (spike S4): a `rate_limit_event` whose status is `rejected`, or an API error of kind `usage_limit_reached`, both carrying the reset time. The run is suspended and the issue relabelled `factory:ready`, with claiming backing off until the limit resets: two minutes after the reported reset time, capped at eight days because weekly limits can be days away. Without a reset time the pause is 30 minutes, doubling with each consecutive hit up to 4 hours. On the next claim the suspended run resumes if the issue is unchanged since its snapshot; otherwise a fresh run supersedes it.
+- **Usage cap.** Every agent stage's stream reports how much of the 5-hour and weekly allowances is used, and dsf keeps the latest reading. Before an agent stage starts, if the weekly allowance is used to `weekly_usage_cap` percent or more (default 80), the run is suspended as for a usage limit and the issue requeued; it continues with the stage it was about to start. Command stages and publishing don't use the allowance, so they go ahead. Rather than a fixed backoff, claiming waits while the latest reading is over the configured cap: until two minutes after the weekly reset, or until the operator raises the cap. The reading comes from the last stage of any run, so at most one stage overshoots the cap; a reading from before the weekly reset says nothing about the new week and is ignored. The 5-hour window resets overnight anyway, so it isn't capped.
 - **Approval gate.** The plan is posted as an issue comment carrying a `dsf:run=<id>` marker, and the issue is labelled `factory:awaiting-approval`. The run continues only when `factory:plan-approved` is added *after* that comment, by an allowlisted user. Rejection is a human relabelling `factory:ready` after editing the spec, which produces a fresh run. An unanswered gate expires to `@blocked` after a configurable time (default 3 days), which every tick checks, inside the window or not. Silence never approves.
 
 A unique index on `(repo, issue)` over non-terminal runs prevents double claims. Resumed runs still respect the window.
@@ -161,7 +162,7 @@ A unique index on `(repo, issue)` over non-terminal runs prevents double claims.
 2. For each repo, list the `factory:ready` issues, saving the list for `dsf status`, and put right any issue labelled `factory:running` that no unfinished run is working on: it moves to wherever its last run ended, or to `factory:blocked` with a comment.
 3. If claiming is allowed, look in on paused runs first (an interrupted run carries on; an approved plan continues; a closed issue cancels its run), then claim queued issues, oldest first, taking turns between repos. If claiming isn't allowed, only waiting plans are checked, so they expire on time.
 
-Claiming is allowed inside the window, unless the operator has paused it (`dsf pause`) or a usage limit started a backoff. It is checked again before each claim, so the window closing or a limit being hit stops new work while runs already going finish. A run that stops because Claude refused its token pauses claiming until the operator runs `dsf unpause`, rather than failing every issue in the queue the same way.
+Claiming is allowed inside the window, unless the operator has paused it (`dsf pause`), a usage limit started a backoff, or the weekly usage is over the cap. It is checked again before each claim, so the window closing or a limit being hit stops new work while runs already going finish. A run that stops because Claude refused its token pauses claiming until the operator runs `dsf unpause`, rather than failing every issue in the queue the same way.
 
 An issue carries exactly one lifecycle label: `draft`, `ready`, `running`, `awaiting-approval`, `review` or `blocked`, each prefixed `factory:`. An issue with more than one is left alone until a human tidies it. Claiming also removes any leftover `factory:plan-approved`, so it can't approve the new run's plan.
 
@@ -229,7 +230,7 @@ The controls below are what make dsf safe to leave running unattended. [`CLAUDE.
 ## 7. Board, digest and configuration
 
 - **Board.** A separate read-only service: axum and server-rendered HTML (maud), refreshed by htmx polling every few seconds. It has no mutating routes, and every view is masked. Its overview is a kanban of the issue lifecycle (ready, running, awaiting approval, review and blocked) under the window and any pause or backoff; `dsf status` prints the same columns as text. Run detail shows the stage timeline, logs, diff stat and PR link, and there is a history page. Cards move only when a person relabels the issue on GitHub: the trust checks (§6.7) rely on knowing which human added a label, and a board that relabelled issues would act as the app.
-- **Digest.** Built from SQLite: draft PRs opened, runs blocked with reasons, queue depth and any active backoff. It is posted as an Adaptive Card.
+- **Digest.** Built from SQLite: draft PRs opened, runs blocked with reasons, queue depth, the latest usage reading and any active backoff. It is posted as an Adaptive Card.
 - **Configuration.** A single file, conventionally `/etc/dsf/config.toml`. [`examples/config.toml`](../examples/config.toml) documents every key with placeholder values, and `dsf config validate` checks a file. It sets:
   - the time zone, window (default 23:00–07:00), digest time (07:00) and worker count (1 or 2); how often a tick runs is the timer's setting;
   - repos and per-repo approval policy (`never`, `label` or `always`; default `label`);
@@ -238,7 +239,7 @@ The controls below are what make dsf safe to leave running unattended. [`CLAUDE.
   - extra egress hosts (the Anthropic API is always allowed);
   - the worker image;
   - extra protected paths;
-  - the state directory, and how long a plan waits for approval (default 3 days).
+  - the state directory, how long a plan waits for approval (default 3 days), and the weekly usage cap (default 80%; 100 leaves it to the real limit).
 
   Unknown keys are errors, so a secret pasted into the wrong place is rejected rather than silently kept. Secrets are files: under systemd, `$CREDENTIALS_DIRECTORY/claude-oauth-token` and `$CREDENTIALS_DIRECTORY/github-app.pem`; otherwise the same names in `~/.config/dsf/`.
 
@@ -349,7 +350,7 @@ The four open questions were answered on 2026-10-18 with Claude Code 2.1.292 in 
   - `unifiedWindows`, giving `utilization` and `resetsAt` for the five-hour and seven-day windows.
 - A refused request ends in an API error of kind `usage_limit_reached`, with `error: "rate_limit"`. Its `api_error_params.rate_limit_info` has the same shape, with status `rejected`.
 - This comes from the CLI's own message schema; a real refusal wasn't triggered, to avoid spending the plan. dsf stores every stage's raw stream, so the first real one becomes a fixture.
-- Because usage is visible on every run, a *headroom* setting is possible: stop claiming while either window's utilization is above a threshold, leaving the rest of the plan for interactive use. Proposed for P4.
+- Because usage is visible on every run, a *headroom* setting is possible: stop claiming while either window's utilization is above a threshold, leaving the rest of the plan for interactive use. Adopted in P4 as the weekly usage cap (§5).
 
 ## Phases and exit criteria
 
@@ -360,7 +361,7 @@ The four open questions were answered on 2026-10-18 with Claude Code 2.1.292 in 
 | P1 — core model | Default workflow validates; property test shows termination within Σ `max_visits`; routing, clamping and DST window tests; `dsf-core` has no IO dependencies |
 | P2 — local engine | A fake agent in real Docker produces checkpoints, the verify/fix loop and a review, and publishes to a `file://` remote. The hostile-worktree suite passes (hooks, fsmonitor, filters, symlink escapes, verify tampering, `.gitmodules`, secrets in diffs are all refused). A kill-and-resume test passes. No `GH_`/`GITHUB_` variables in any container. |
 | P3 — GitHub | Mocked-API suite covers claiming, the allowlist, blocked-by, comment filtering, idempotent publishing and a stale label list (no double claims). One real draft PR on a sandbox repo. |
-| P4 — unattended running | Clock-injected scenario tests for `dsf tick`: the window, pausing and backoff, usage-limit requeue and resume, approval expiry, crash recovery and label repair. Digest snapshot. `dsf doctor` passes. |
+| P4 — unattended running | Clock-injected scenario tests for `dsf tick`: the window, pausing and backoff, usage-limit requeue and resume, the weekly usage cap, approval expiry, crash recovery and label repair. Digest snapshot. `dsf doctor` passes. |
 | P5 — packaging | A tag publishes a static x86_64 musl binary with checksums, and a worker image with a pinned Claude Code version |
 | P6 — first deployment | A real overnight run produces a draft PR. An agent container provably cannot reach a non-allowlisted host. The digest arrives. dsf opens its first draft PR against itself. |
 | P7 — board | The kanban overview and run pages render as HTML snapshots from a fixture database; a route-enumeration test finds no mutating routes; logs are masked |
