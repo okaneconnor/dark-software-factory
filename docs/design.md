@@ -33,7 +33,8 @@ A tick is one pass over everything dsf looks after, and it keeps nothing in memo
 - **Scheduler** (`dsf tick`). Recovers from any crash, lists each repo's queue, puts stale labels right and expires unanswered plans; then, inside the window, carries on paused runs and claims issues, up to the worker limit, until nothing is left (§5, Scheduling).
 - **Runs.** Each executes its workflow stage by stage, inside the tick's process.
 - **Egress proxy.** The agent containers' only route to the internet (§6). It runs as a sidecar container from the dsf binary itself, attached to both Docker's default bridge and the agents' internal network, so agent traffic stays on Docker networks and never meets the host's firewall.
-- **Digest.** A second timer sends the morning summary.
+- **Digest** (`dsf digest`). A second timer, at 07:00 with `Persistent=true`, sends the morning summary; a digest missed while the host was down goes out when it comes back, and each covers everything since the last.
+- **Doctor** (`dsf doctor`). A preflight run once at deployment and whenever something looks wrong, as the same user and with the same credentials as a tick.
 - **Board.** A separate, read-only service on `127.0.0.1`, exposed by the operator if wanted (e.g. `tailscale serve`). It never holds the GitHub key or the Claude token.
 
 Fabro runs a long-lived server with its own scheduler loop, because it serves an API to many users. dsf is one person's overnight batch job, which is what timers are for: there is less to go wrong, `systemctl list-timers` and `journalctl` show what happened, and stopping the timer is an off switch. [`examples/systemd/`](../examples/systemd/) has the units.
@@ -48,12 +49,12 @@ CLI commands for operators and development:
 | `dsf tick` | One pass of the factory (§5, Scheduling). The timer runs it. |
 | `dsf status` | The queue, runs in progress and the last week's results, read from the store alone |
 | `dsf pause [reason]`, `dsf unpause` | Stop and restart claiming. Runs already going carry on. |
-| `dsf doctor` | Preflight: Docker, tokens, image, config, labels |
+| `dsf doctor` | Preflight: the config, state directory, secret files (present and private), the GitHub App, each repo (app installed, labels, `.factory/verify.sh`), Docker and the images. Each problem comes with its fix; exits non-zero if anything fails. Changes nothing. |
 | `dsf workflow validate <file> [--config <file>]` | Validate a workflow file, applying the operator's caps when a config is given |
 | `dsf workflow default` | Print the built-in workflow, a starting point for a repo's own |
 | `dsf config validate <file>` | Validate a config file, including its time zone |
 | `dsf labels init` | Create the label set in configured repos |
-| `dsf digest --dry-run` | Render the digest without sending it |
+| `dsf digest [--dry-run]` | Send the digest: to Teams if a webhook is configured, otherwise to stdout. `--dry-run` prints it without sending or recording it. |
 
 ## 4. Pipeline and per-repo workflows
 
@@ -230,9 +231,9 @@ The controls below are what make dsf safe to leave running unattended. [`CLAUDE.
 ## 7. Board, digest and configuration
 
 - **Board.** A separate read-only service: axum and server-rendered HTML (maud), refreshed by htmx polling every few seconds. It has no mutating routes, and every view is masked. Its overview is a kanban of the issue lifecycle (ready, running, awaiting approval, review and blocked) under the window and any pause or backoff; `dsf status` prints the same columns as text. Run detail shows the stage timeline, logs, diff stat and PR link, and there is a history page. Cards move only when a person relabels the issue on GitHub: the trust checks (§6.7) rely on knowing which human added a label, and a board that relabelled issues would act as the app.
-- **Digest.** Built from SQLite: draft PRs opened, runs blocked with reasons, queue depth, the latest usage reading and any active backoff. It is posted as an Adaptive Card.
+- **Digest.** Built from SQLite alone: the draft PRs opened, runs blocked or canceled with their reasons since the last digest (the first looks back a day, none more than a week), plans awaiting approval, runs in progress, the queue, the latest usage reading, and whether claiming is allowed. It warns when no tick has run for an hour, which means the timer has stopped, and when claiming is paused. It is posted to a Teams Workflows webhook as an Adaptive Card; the webhook URL is a secret, a credential file like the others, and never appears in an error. Without one, the digest is printed for the journal.
 - **Configuration.** A single file, conventionally `/etc/dsf/config.toml`. [`examples/config.toml`](../examples/config.toml) documents every key with placeholder values, and `dsf config validate` checks a file. It sets:
-  - the time zone, window (default 23:00–07:00), digest time (07:00) and worker count (1 or 2); how often a tick runs is the timer's setting;
+  - the time zone, window (default 23:00–07:00) and worker count (1 or 2); how often a tick runs, and when the digest goes out, are the timers' settings;
   - repos and per-repo approval policy (`never`, `label` or `always`; default `label`);
   - the user allowlist, and the GitHub App's ID;
   - caps;
@@ -241,7 +242,7 @@ The controls below are what make dsf safe to leave running unattended. [`CLAUDE.
   - extra protected paths;
   - the state directory, how long a plan waits for approval (default 3 days), and the weekly usage cap (default 80%; 100 leaves it to the real limit).
 
-  Unknown keys are errors, so a secret pasted into the wrong place is rejected rather than silently kept. Secrets are files: under systemd, `$CREDENTIALS_DIRECTORY/claude-oauth-token` and `$CREDENTIALS_DIRECTORY/github-app.pem`; otherwise the same names in `~/.config/dsf/`.
+  Unknown keys are errors, so a secret pasted into the wrong place is rejected rather than silently kept. Secrets are files: under systemd, `$CREDENTIALS_DIRECTORY/claude-oauth-token`, `$CREDENTIALS_DIRECTORY/github-app.pem` and, optionally, `$CREDENTIALS_DIRECTORY/teams-webhook-url`; otherwise the same names in `~/.config/dsf/`.
 
 - **Setting up the GitHub App.** Once per operator:
   1. Create a GitHub App (Settings → Developer settings → GitHub Apps) with webhooks off, installable only on your account, and repository permissions Contents, Issues and Pull requests set to read and write. Nothing else; in particular, not Workflows.
@@ -254,7 +255,7 @@ The controls below are what make dsf safe to leave running unattended. [`CLAUDE.
 ```
 crates/dsf-core/      pure domain model (no IO, enforced in CI)
 crates/dsf/           the binary: cli, scheduler, status, factory (GitHub side), github, engine, hostgit,
-                      sandbox, agent, proxy, store; digest and web to come
+                      sandbox, agent, proxy, store, usage, digest, doctor; web to come
 defaults/             default workflow and prompt templates (embedded)
 crates/dsf/tests/fake-agent/  test-only: a shell `claude` that acts on `fake-<stage>:` lines in the
                       issue and prints stream-json, in a small Alpine image
