@@ -76,8 +76,15 @@ CREATE TABLE kv (
 ) STRICT;
 ";
 
+/// Where a run's repository comes from and where its branch goes. Kept on
+/// the run so it can resume without being told again.
+const SCHEMA_V2: &str = "
+ALTER TABLE runs ADD COLUMN clone_url TEXT NOT NULL DEFAULT '';
+ALTER TABLE runs ADD COLUMN publish_url TEXT NOT NULL DEFAULT '';
+";
+
 fn migrations() -> Migrations<'static> {
-    Migrations::new(vec![M::up(SCHEMA_V1)])
+    Migrations::new(vec![M::up(SCHEMA_V1), M::up(SCHEMA_V2)])
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -170,6 +177,8 @@ pub struct NewRun<'a> {
     pub author: &'a str,
     pub updated_at: Option<&'a str>,
     pub workflow: &'a str,
+    pub clone_url: &'a str,
+    pub publish_url: &'a str,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -191,6 +200,8 @@ pub struct Run {
     pub plan: Option<String>,
     pub end_reason: Option<String>,
     pub pr_number: Option<u64>,
+    pub clone_url: String,
+    pub publish_url: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -204,6 +215,8 @@ pub struct Attempt {
     pub container_id: Option<String>,
     pub exit_code: Option<i64>,
     pub after_sha: Option<String>,
+    /// The JSON Claude returned for a schema stage.
+    pub structured_output: Option<String>,
 }
 
 /// How a stage attempt ended.
@@ -274,8 +287,8 @@ impl Store {
         let now = now.to_string();
         let inserted = self.conn.execute(
             "INSERT INTO runs (repo, issue, status, progress, workflow, issue_title, issue_body,
-                               issue_author, issue_updated_at, created_at, updated_at)
-             VALUES (?1, ?2, 'queued', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
+                               issue_author, issue_updated_at, created_at, updated_at, clone_url, publish_url)
+             VALUES (?1, ?2, 'queued', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10, ?11)",
             params![
                 new.repo,
                 i64::try_from(new.issue)?,
@@ -285,7 +298,9 @@ impl Store {
                 new.body,
                 new.author,
                 new.updated_at,
-                now
+                now,
+                new.clone_url,
+                new.publish_url
             ],
         );
         match inserted {
@@ -312,6 +327,24 @@ impl Store {
         self.conn.execute(
             "UPDATE runs SET base_sha = ?2, checkpoint_sha = ?2, updated_at = ?3 WHERE id = ?1",
             params![run_id, sha, now.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Replaces the workflow snapshot, once the repo's own has been read.
+    pub fn set_workflow(&mut self, run_id: i64, workflow: &str, now: Timestamp) -> Result<()> {
+        self.conn.execute(
+            "UPDATE runs SET workflow = ?2, updated_at = ?3 WHERE id = ?1",
+            params![run_id, workflow, now.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Saves routing state between boundaries, e.g. an interruption count.
+    pub fn set_progress(&mut self, run_id: i64, progress: &Progress, now: Timestamp) -> Result<()> {
+        self.conn.execute(
+            "UPDATE runs SET progress = ?2, updated_at = ?3 WHERE id = ?1",
+            params![run_id, serde_json::to_string(progress)?, now.to_string()],
         )?;
         Ok(())
     }
@@ -492,7 +525,8 @@ impl Store {
 
     pub fn attempts(&self, run_id: i64) -> Result<Vec<Attempt>> {
         let mut query = self.conn.prepare(
-            "SELECT id, stage, visit, status, outcome, failure, container_id, exit_code, after_sha
+            "SELECT id, stage, visit, status, outcome, failure, container_id, exit_code, after_sha,
+                    structured_output
              FROM stage_attempts WHERE run_id = ?1 ORDER BY id",
         )?;
         let attempts = query
@@ -507,6 +541,7 @@ impl Store {
                     container_id: row.get(6)?,
                     exit_code: row.get(7)?,
                     after_sha: row.get(8)?,
+                    structured_output: row.get(9)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -576,6 +611,8 @@ struct RunRow {
     plan: Option<String>,
     end_reason: Option<String>,
     pr_number: Option<i64>,
+    clone_url: String,
+    publish_url: String,
 }
 
 impl RunRow {
@@ -598,6 +635,8 @@ impl RunRow {
             plan: row.get("plan")?,
             end_reason: row.get("end_reason")?,
             pr_number: row.get("pr_number")?,
+            clone_url: row.get("clone_url")?,
+            publish_url: row.get("publish_url")?,
         })
     }
 
@@ -620,6 +659,8 @@ impl RunRow {
             plan: self.plan,
             end_reason: self.end_reason,
             pr_number: self.pr_number.map(u64::try_from).transpose()?,
+            clone_url: self.clone_url,
+            publish_url: self.publish_url,
         })
     }
 }
@@ -642,6 +683,8 @@ mod tests {
             author: "octocat",
             updated_at: Some("2026-10-18T22:00:00Z"),
             workflow: dsf_core::workflow::DEFAULT_TOML,
+            clone_url: "https://github.com/octocat/hello.git",
+            publish_url: "https://github.com/octocat/hello.git",
         }
     }
 
@@ -706,6 +749,11 @@ mod tests {
         assert_eq!(attempts[0].status, "finished");
         assert_eq!(attempts[0].outcome.as_deref(), Some("ready"));
         assert_eq!(attempts[0].container_id.as_deref(), Some("c0ffee"));
+        assert_eq!(
+            attempts[0].structured_output.as_deref(),
+            Some(r#"{"outcome":"ready"}"#)
+        );
+        assert_eq!(run.publish_url, "https://github.com/octocat/hello.git");
     }
 
     #[test]
