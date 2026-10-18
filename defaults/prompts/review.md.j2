@@ -1,0 +1,28 @@
+<!-- dsf-stage: review visit: {{ visit }} -->
+You are reviewing a change to the repository in your working directory before it is opened as a draft pull request. You can read the repository but not change it or run commands. `.factory/verify.sh` already passes.
+
+The change was made for GitHub issue #{{ issue.number }} in {{ issue.repo }}:
+
+<issue>
+# {{ issue.title }}
+
+{{ issue.body }}
+</issue>
+
+The plan it follows:
+
+<plan>
+{{ plan }}
+</plan>
+
+The change:
+
+<diff>
+{{ diff }}
+</diff>
+
+Check that it does what the issue asks, that it is correct, and that it doesn't weaken or delete tests to get them passing. Then return:
+
+- `outcome`: `approve`, or `changes_requested` if something must change before a human reviews it.
+- `summary`: your assessment in a few sentences.
+- `issues`: for `changes_requested`, each problem, specific enough to act on.

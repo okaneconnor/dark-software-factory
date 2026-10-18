@@ -2,7 +2,7 @@
 
 `dsf` turns GitHub issues you have approved into verified **draft** pull requests, unattended, overnight. It drives [Claude Code](https://claude.com/claude-code) in headless mode inside locked-down containers that never hold a GitHub token, and it treats a script in the target repo as the only definition of "done".
 
-> **Status: pre-alpha, under construction.** The factory doesn't run work yet; so far `dsf` validates workflow and config files. The design is in [`docs/design.md`](docs/design.md) and progress is tracked in the [roadmap](#roadmap).
+> **Status: pre-alpha, under construction.** `dsf run --local` runs an issue end to end against a local repository: plan, implement, verify, review, publish a branch. GitHub integration and the unattended daemon come next. The design is in [`docs/design.md`](docs/design.md) and progress is tracked in the [roadmap](#roadmap).
 
 ## How it works
 

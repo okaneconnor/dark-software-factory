@@ -278,6 +278,15 @@ impl HostGit {
         Ok((repo, head))
     }
 
+    /// An existing run's repository, for resuming it.
+    pub fn open(git: Git, git_dir: &Path, work_tree: &Path) -> Self {
+        Self {
+            git,
+            git_dir: git_dir.to_owned(),
+            work_tree: work_tree.to_owned(),
+        }
+    }
+
     pub fn git_dir(&self) -> &Path {
         &self.git_dir
     }

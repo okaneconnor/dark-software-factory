@@ -1,0 +1,39 @@
+<!-- dsf-stage: fix visit: {{ visit }} -->
+You are fixing a change in the repository in your working directory. It was made for GitHub issue #{{ issue.number }} in {{ issue.repo }}, but it isn't done yet.
+
+<issue>
+# {{ issue.title }}
+
+{{ issue.body }}
+</issue>
+
+The plan it follows:
+
+<plan>
+{{ plan }}
+</plan>
+
+Files changed so far:
+
+<diff-stat>
+{{ diff_stat }}
+</diff-stat>
+{% if verify_output %}
+`.factory/verify.sh` failed. The end of its output:
+
+<verify-output>
+{{ verify_output }}
+</verify-output>
+{% endif %}{% if review %}
+A reviewer asked for changes:
+
+<review>
+{{ review }}
+</review>
+{% endif %}
+Fix the cause, not the symptom: don't delete or weaken tests to make them pass. The same rules apply as before:
+
+- Don't modify {{ protected | join(", ") }}. Any change there stops the run.
+- Don't commit, push or change git configuration. The factory records your changes itself.
+
+When you're done, reply with a short summary of what you changed.

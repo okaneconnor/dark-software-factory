@@ -1,0 +1,31 @@
+---
+source: crates/dsf/src/prompts.rs
+expression: rendered
+---
+<!-- dsf-stage: implement visit: 2 -->
+You are implementing a planned change in the repository in your working directory.
+
+The task is GitHub issue #7 in octocat/calc:
+
+<issue>
+# add() subtracts
+
+`add(2, 3)` returns -1.
+
+fake-implement: fix-calc
+</issue>
+
+The agreed plan:
+
+<plan>
+Change `a - b` to `a + b` in calc.py.
+</plan>
+
+Rules:
+
+- Make the change the plan describes, adding or updating tests where the repository has them.
+- Don't modify .factory/, .github/, .claude/, .mcp.json. Any change there stops the run.
+- Don't commit, push or change git configuration. The git directory is read-only; the factory records your changes itself.
+- Run `.factory/verify.sh` if you can and fix what it reports. If it needs network access you don't have, say so and stop there.
+
+When you're done, reply with a short summary of what you changed.

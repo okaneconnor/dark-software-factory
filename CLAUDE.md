@@ -9,6 +9,7 @@ Conventions for anyone changing this repo, human or agent. This includes the fac
 | `.factory/verify.sh` | The gate: `cargo fmt --check`, clippy with `-D warnings`, all tests. CI runs exactly this. A change is not done until it passes. |
 | `cargo test -p dsf-core` | Fast loop for the pure core. |
 | `cargo deny check` | Licences, advisories and sources. Runs in CI. |
+| `DSF_DOCKER_TESTS=1 cargo test` | Also runs the Docker-backed tests: container hardening, the proxy sidecar and the end-to-end engine suite with the fake agent. CI sets this. The proxy sidecar test needs `docker build -f docker/dsf.Dockerfile -t dsf:dev .` first. |
 
 The toolchain is pinned in `rust-toolchain.toml`.
 
