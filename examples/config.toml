@@ -1,6 +1,7 @@
 # Example dsf configuration, normally installed as /etc/dsf/config.toml.
 # Every value below is a placeholder. Secrets never go in this file: the
-# Claude token, GitHub token and Teams webhook come from the environment.
+# Claude token, the GitHub App's private key and the Teams webhook are
+# separate files (see docs/design.md).
 # Check a config with `dsf config validate <file>`.
 
 # IANA time zone for the window and the digest.
@@ -27,6 +28,10 @@ state_dir = "/var/lib/dsf"
 # Issues are picked up only when both the author and whoever added
 # factory:ready are listed here.
 allowed_users = ["your-github-login"]
+# The GitHub App dsf acts as: create one with Contents, Issues and Pull
+# requests read/write, install it on the repos below only, and put its App
+# ID here. Its private key is a separate file, never this one.
+app_id = 123456
 
 [[repos]]
 name = "your-github-login/example-repo"

@@ -1,8 +1,8 @@
 //! The operator's configuration file, conventionally `/etc/dsf/config.toml`.
 //!
-//! Secrets never live here. The Claude token, GitHub token and Teams
-//! webhook come from the environment or systemd credentials, so this file
-//! can be world-readable and kept in version control.
+//! Secrets never live here. The Claude token, the GitHub App's private key
+//! and the Teams webhook come from files or systemd credentials, so this
+//! file can be world-readable and kept in version control.
 
 use std::fmt;
 use std::path::PathBuf;
@@ -38,6 +38,8 @@ pub struct Config {
     pub approval_expiry: Duration,
     pub state_dir: PathBuf,
     pub allowlist: Allowlist,
+    /// The GitHub App dsf acts as. Only `--local` runs work without one.
+    pub github_app_id: Option<u64>,
     pub repos: Vec<RepoConfig>,
     pub caps: Caps,
     /// Every host agent containers may reach: the built-ins plus the
@@ -45,6 +47,8 @@ pub struct Config {
     pub egress: Vec<String>,
     pub worker_image: String,
     pub protected: ProtectedPaths,
+    /// The operator's own protected paths, as written.
+    pub protect_extra: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,6 +163,7 @@ struct RawWindow {
 #[serde(deny_unknown_fields)]
 struct RawGithub {
     allowed_users: Vec<String>,
+    app_id: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -336,6 +341,12 @@ impl RawConfig {
             }
         }
         let allowlist = Allowlist::new(&self.github.allowed_users);
+        if self.github.app_id == Some(0) {
+            check.fail(
+                "github.app_id",
+                "expected the App ID from the app's settings page",
+            );
+        }
 
         if self.repos.is_empty() {
             check.fail("repos", "configure at least one repo");
@@ -419,11 +430,13 @@ impl RawConfig {
             approval_expiry,
             state_dir,
             allowlist,
+            github_app_id: self.github.app_id,
             repos,
             caps,
             egress,
             worker_image,
             protected,
+            protect_extra: self.protect.extra,
         })
     }
 }
