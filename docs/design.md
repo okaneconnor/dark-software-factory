@@ -19,7 +19,7 @@ dsf is deliberately small and single-user. The reference design is [Fabro](https
 | Credentials | **The agent never holds a GitHub credential.** The host clones, commits and pushes. |
 | Done | The target repo's `.factory/verify.sh` exits 0. Failures feed a bounded fix loop. |
 | Limits | A usage-limit hit requeues the issue and pauses claiming until the limit resets. |
-| Schedule | Claims only inside a configurable window (default 23:00–07:00 local); running work finishes. One worker by default, maximum two. |
+| Schedule | Claims only inside a configurable window (default 23:00–07:00 local wall-clock time; it may span midnight, and equal start and end mean always open); running work finishes. One worker by default, maximum two. |
 | Reporting | A morning digest (default 07:00) to a Microsoft Teams Workflows webhook, or to stdout. |
 | v1 scope | Staged pipeline, per-repo workflows, optional plan-approval gate, read-only web runs board. |
 
@@ -40,7 +40,9 @@ CLI commands for operators and development:
 | `dsf run owner/repo#N` | Run one issue in the foreground |
 | `dsf run --local <repo> --issue-file <file>` | Run against a local repo with no GitHub, for development and tests |
 | `dsf doctor` | Preflight: Docker, tokens, image, config, labels |
-| `dsf workflow validate <file>` | Validate a workflow file |
+| `dsf workflow validate <file> [--config <file>]` | Validate a workflow file, applying the operator's caps when a config is given |
+| `dsf workflow default` | Print the built-in workflow, a starting point for a repo's own |
+| `dsf config validate <file>` | Validate a config file, including its time zone |
 | `dsf labels init` | Create the label set in configured repos |
 | `dsf digest --dry-run` | Render the digest without sending it |
 
@@ -111,12 +113,15 @@ exhausted = "@publish"
 
 **Rules:**
 
-- **Visit caps.** Each stage has a `max_visits` (default 1). When a stage would be entered beyond its cap, the run goes to the stage's `exhausted` target (default `@blocked`). Total work is therefore bounded by Σ `max_visits`, so every valid workflow terminates.
-- **Validation.** Every referenced stage exists, every outcome label a stage can produce has a route, every stage is reachable from `start`, and `@publish` is reachable.
-- **Repeat-failure breaker.** If verify fails twice with the same normalised output, the run goes to `@blocked` rather than spending the remaining visits.
+- **Stages.** Names match `[a-z][a-z0-9_-]*`, at most 32 characters. Unknown keys anywhere are errors, which is also what stops a repo from setting images, mounts or limits.
+- **Agent stages** need `mode` and `prompt`; `schema` is optional. There are two schemas: `plan`, with outcomes `ready` and `needs_decision`, and `review`, with `approve` and `changes_requested`.
+- **Command stages** run one script under `.factory/`, with no shell and no arguments, from the snapshot of `.factory/` taken at the run's base commit. Anything else, such as `make test`, is refused, because the agent could edit the `Makefile` and so weaken the check that judges its work. `timeout` defaults to 30 minutes. `network` defaults to `none`; `proxy` opts in to the egress proxy.
+- **Visit caps.** Each stage has a `max_visits` (default 1). When a stage would be entered beyond its cap, the run goes to the stage's `exhausted` target (default `@blocked`), which must be `@publish` or `@blocked`. Total work is therefore bounded by Σ `max_visits`, so every valid workflow terminates; a property test checks this over arbitrary graphs. The default workflow's budget is 13, and its longest possible run is 12 stage visits.
+- **Validation.** Every referenced stage exists, every outcome label a stage can produce has a route and no other label does, every stage is reachable from `start`, and `@publish` is reachable through a route or an `exhausted` target. Validation reports every problem at once.
+- **Repeat-failure breaker.** If a stage fails twice in a row with the same failure signature, the run goes to `@blocked` rather than spending the remaining visits. The signature is an FNV-1a hash of the last 40 lines of output after removing colour codes, timings, timestamps, addresses and temporary paths, so identical failures match while a change in what failed doesn't. Any other result from the stage resets it.
 - **Per-repo overrides.** A target repo may provide `.factory/workflow.toml` and `.factory/prompts/*.md.j2`. dsf reads them from the **default branch at claim time** and snapshots them into the run, so the agent cannot change the rules it is running under.
-- **Clamping.** Repo files may only tune what the operator allows. Visit counts and timeouts are clamped to host caps. Images, mounts, resource limits, agent-stage networking and protected paths are not settable from a repo at all. Publishing is built in and not configurable.
-- **Prompts** are minijinja templates. The defaults are embedded in the binary.
+- **Clamping.** Repo files may only tune what the operator allows. Visit counts and command timeouts above the operator's caps (by default 5 visits per stage and 60 minutes) are lowered, and the run reports each change. A workflow with more stages than the cap (default 16) is refused. Images, mounts, resource limits, agent-stage networking and protected paths are not settable from a repo at all. Publishing is built in and not configurable.
+- **Prompts** are minijinja templates named `[a-z0-9_-]+.md.j2`, looked up in the run's snapshot, so a name can't point anywhere else. The defaults are embedded in the binary.
 
 ## 5. Run state, suspension and resume
 
@@ -134,10 +139,12 @@ A run moves `queued → running → suspended{approval | usage_limit | interrupt
 Resuming a run always resets the worktree to `checkpoint_sha`, cleans it, and executes `next_stage`.
 
 - **Crash or restart.** On startup, containers labelled with an unfinished attempt are removed and the attempt is marked `interrupted`; the stage then re-runs. An interruption does not consume a visit, but two in a row block the run.
-- **Usage limit.** The run is suspended and the issue relabelled `factory:ready`, with claiming paused until the limit resets. On the next claim the suspended run resumes if the issue is unchanged since its snapshot; otherwise a fresh run supersedes it.
+- **Usage limit.** The run is suspended and the issue relabelled `factory:ready`, with claiming paused until the limit resets: two minutes after the reported reset time, capped at eight days because weekly limits can be days away. Without a reset time the pause is 30 minutes, doubling with each consecutive hit up to 4 hours. On the next claim the suspended run resumes if the issue is unchanged since its snapshot; otherwise a fresh run supersedes it.
 - **Approval gate.** The plan is posted as an issue comment carrying a `dsf:run=<id>` marker, and the issue is labelled `factory:awaiting-approval`. The run continues only when `factory:plan-approved` is added *after* that comment, by an allowlisted user. Rejection is a human relabelling `factory:ready` after editing the spec, which produces a fresh run. An unanswered gate expires to `@blocked` after a configurable number of days. Silence never approves.
 
 A unique index on `(repo, issue)` over non-terminal runs prevents double claims. Resumed runs still respect the window.
+
+An issue carries exactly one lifecycle label: `draft`, `ready`, `running`, `awaiting-approval`, `review` or `blocked`, each prefixed `factory:`. An issue with more than one is left alone until a human tidies it. Claiming also removes any leftover `factory:plan-approved`, so it can't approve the new run's plan.
 
 ## 6. Security model
 
@@ -160,7 +167,7 @@ The controls below are what make dsf safe to leave running unattended. [`CLAUDE.
    - Diffs are computed between recorded SHAs (`base_sha`, `checkpoint_sha`), never against refs the agent could influence.
    - Pushes use an explicit URL and `<sha>:refs/heads/factory/issue-<n>`. Authentication is a URL-scoped `http.extraheader` passed through `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_*` environment variables, so the token is never written to disk.
 2. **No symlink following.** The host never follows symlinks in a worktree. Agent outputs are read from Claude's stream-json result or from git objects (`git cat-file`). Trees containing gitlinks, `.gitmodules` or symlinks that escape the repo are refused.
-3. **Protected paths.** After **every** agent stage, the change since `base_sha` is checked against `.factory/`, `.github/`, `.claude/`, `.mcp.json` and any operator additions. A violation is deterministic and blocks the run immediately.
+3. **Protected paths.** After **every** agent stage, the change since `base_sha` is checked against `.factory/`, `.github/`, `.claude/`, `.mcp.json` and any operator additions. An entry covers the path itself and everything beneath it, ignoring ASCII case. A violation is deterministic and blocks the run immediately. The `.factory/` snapshot that command stages run is extracted from git objects at `base_sha`, and a snapshot containing a symlink is refused: one could point at a file the agent is free to edit.
 4. **Hardened containers.**
    - Settings: non-root user, `cap-drop ALL`, `no-new-privileges`, a read-only root filesystem with tmpfs `/tmp` and `HOME`, PID, memory and CPU limits, and no Docker socket.
    - Environment: cleared, with an allowlist. Only `CLAUDE_CODE_OAUTH_TOKEN` and proxy settings reach agent containers, and verify containers receive no secrets.
@@ -175,7 +182,7 @@ The controls below are what make dsf safe to leave running unattended. [`CLAUDE.
    - A masker redacts every known secret value from everything that leaves the host: logs, board pages, GitHub comments and PR bodies, digests.
    - Before any push, the exact diff is scanned for literal secret values.
 7. **Trusted input only.**
-   - dsf acts only on configured repos, and only on issues whose author **and** the user who applied `factory:ready` are on the operator allowlist, verified through the issue events API. This matters because repos, including this one, may be public.
+   - dsf acts only on configured repos, and only on issues whose author **and** the user who applied `factory:ready` are on the operator allowlist, verified through the issue events API. Logins are compared case-insensitively, as GitHub does. This matters because repos, including this one, may be public.
    - Only allowlisted users' comments are included in prompts.
    - If the issue body changes after claiming, the run re-plans.
 
@@ -183,21 +190,23 @@ The controls below are what make dsf safe to leave running unattended. [`CLAUDE.
 
 - The Claude token is necessarily inside the agent container, so a compromised agent can misuse it within the subscription's limits. The egress allowlist limits where it could send it.
 - The `factory` user's Docker access is root-equivalent on the host. The dedicated VM is the containment.
+- Verify runs the repo's own tests, which the agent may edit, for example by deleting a failing test. Protecting `.factory/` stops it weakening the gate itself, not the tests the gate runs. The review stage and the human reviewing the draft PR are the check on that, which is one reason dsf never merges.
 
 ## 7. Board, digest and configuration
 
 - **Board.** axum and server-rendered HTML (maud), refreshed by htmx polling every few seconds. It has no mutating routes, and every view is masked. Pages: the overview (queue, running, backoff, window), run detail (stage timeline, logs, diff stat, PR link) and history.
 - **Digest.** Built from SQLite: draft PRs opened, runs blocked with reasons, queue depth and any active backoff. It is posted as an Adaptive Card.
-- **Configuration.** A single file, conventionally `/etc/dsf/config.toml`, sets:
-  - repos and per-repo approval policy (`never`, `label` or `always`);
+- **Configuration.** A single file, conventionally `/etc/dsf/config.toml`. [`examples/config.toml`](../examples/config.toml) documents every key with placeholder values, and `dsf config validate` checks a file. It sets:
+  - the time zone, window (default 23:00–07:00), digest time (07:00), poll interval (5 minutes) and worker count (1 or 2);
+  - repos and per-repo approval policy (`never`, `label` or `always`; default `label`);
   - the user allowlist;
-  - the window and worker count;
   - caps;
-  - the egress allowlist;
-  - image references;
-  - paths.
+  - extra egress hosts (the Anthropic API is always allowed);
+  - the worker image;
+  - extra protected paths;
+  - the state directory, and how long a plan waits for approval (default 3 days).
 
-  Secrets come from systemd credentials or an environment file. The repo ships only `examples/config.toml`, with placeholders.
+  Unknown keys are errors, so a secret pasted into the wrong place is rejected rather than silently kept. Secrets come from systemd credentials or an environment file.
 
 ## 8. Repo layout and stack
 

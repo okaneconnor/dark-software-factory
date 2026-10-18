@@ -14,7 +14,7 @@ The toolchain is pinned in `rust-toolchain.toml`.
 
 ## Layout
 
-- `crates/dsf-core` is the pure domain model: config, workflows, routing, labels and scheduling rules. **No IO** of any kind: no `std::fs`, `std::process`, network, async runtime or clock reads. Pass time and data in as arguments. This keeps the logic that decides what the factory does deterministic and exhaustively testable.
+- `crates/dsf-core` is the pure domain model: config, workflows, routing, labels and scheduling rules. **No IO** of any kind: no `std::fs`, `std::process`, network, async runtime or clock reads. Pass time and data in as arguments. This keeps the logic that decides what the factory does deterministic and exhaustively testable. `crates/dsf-core/clippy.toml` turns the usual IO entry points into lint errors, and `crates/dsf/tests/core_purity.rs` allowlists its dependencies.
 - `crates/dsf` is the binary, and owns every side effect: git, Docker, GitHub, storage, the web board.
 
 ## Code rules
@@ -23,7 +23,7 @@ The toolchain is pinned in `rust-toolchain.toml`.
 - Errors: `thiserror` types in `dsf-core`, `anyhow` with context at the binary's edges.
 - New behaviour comes with tests. Use unit tests in `dsf-core`, `insta` snapshots for rendered output (prompts, PR bodies, cards, HTML), and `assert_cmd` for the CLI.
 - Match the surrounding code. Keep modules small and focused, and make comments explain *why*, not *what*.
-- Adding a dependency means checking its licence against `deny.toml`. Prefer a few well-known crates over many small ones.
+- Adding a dependency means checking its licence against `deny.toml`; adding one to `dsf-core` also means confirming it does no IO and listing it in `core_purity.rs`. Prefer a few well-known crates over many small ones.
 
 ## Security invariants
 
