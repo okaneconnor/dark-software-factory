@@ -48,7 +48,7 @@ Each target repo can tune this pipeline in `.factory/workflow.toml`, within limi
 
 | Phase | Scope | Status |
 |---|---|---|
-| S | Spikes: Claude Code in a hardened container, read-only `.git`, egress proxy, usage-limit errors | **In progress** |
+| S | Spikes: Claude Code in a hardened container, read-only `.git`, egress proxy, usage-limit errors | Done |
 | P0 | Repo foundations: workspace, CI, gate, docs | Done |
 | P1 | Core model: workflows, routing, labels, scheduling rules | **In progress** |
 | P2 | Local engine: host git, sandbox, agent adapter, verify loop, store | Planned |
