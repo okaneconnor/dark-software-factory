@@ -13,6 +13,8 @@ allow = [
     "Apache-2.0",
     "MIT",
     "Unicode-3.0",
+    # foldhash, via the SQLite crates' hash tables.
+    "Zlib",
 ]
 confidence-threshold = 0.8
 
