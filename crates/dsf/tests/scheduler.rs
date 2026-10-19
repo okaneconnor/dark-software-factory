@@ -186,6 +186,66 @@ async fn over_the_usage_cap_claiming_waits_unless_the_cap_is_raised() {
 }
 
 #[tokio::test]
+async fn runs_of_repos_taken_out_of_the_config_are_canceled() {
+    let world = World::new("forget");
+    let fake = Fake::start().await;
+    fake.listing("factory:ready", json!([])).await;
+    fake.listing("factory:running", json!([])).await;
+    let mut store = world.store();
+    let gone = store
+        .create_run(
+            &NewRun {
+                repo: "octo/gone",
+                issue: 6,
+                title: "an old test",
+                body: "",
+                author: "alice",
+                updated_at: None,
+                workflow: dsf_core::workflow::DEFAULT_TOML,
+                clone_url: "",
+                publish_url: "",
+                comments: "[]",
+                require_approval: true,
+            },
+            at("2026-10-18T09:30:00Z"),
+        )
+        .unwrap()
+        .unwrap();
+    let kept = seed_run(&mut store, 1);
+    // Both wait for plan approval, as a leftover run would.
+    for run in [gone, kept] {
+        let attempt = store
+            .start_attempt(run, "approve", 1, None, at("2026-10-18T09:59:00Z"))
+            .unwrap();
+        store
+            .finish_attempt(
+                run,
+                attempt,
+                &AttemptEnd::default(),
+                &Progress::default(),
+                None,
+                Advance::Suspend {
+                    reason: SuspendReason::Approval,
+                    resume_after: None,
+                },
+                at("2026-10-18T09:59:00Z"),
+            )
+            .unwrap();
+    }
+
+    let record = scheduler(&world, &fake, "", "fake", at(NIGHT))
+        .tick()
+        .await
+        .unwrap();
+    assert_eq!(
+        record.notes[0],
+        format!("octo/gone#6: run {gone} canceled, because its repo is no longer in the config")
+    );
+    assert_eq!(world.store().run(gone).unwrap().status, RunStatus::Canceled);
+    assert_ne!(world.store().run(kept).unwrap().status, RunStatus::Canceled);
+}
+
+#[tokio::test]
 async fn issues_left_labelled_running_are_put_right() {
     let world = World::new("repair");
     let fake = Fake::start().await;

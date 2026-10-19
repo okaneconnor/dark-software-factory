@@ -235,6 +235,39 @@ mod tests {
         assert_eq!(system_prompt("", &[]).unwrap(), "");
     }
 
+    /// Every pack shipped in `examples/packs` is a usable plugin whose JSON
+    /// parses and whose rules point at a skill it really has.
+    #[test]
+    fn the_shipped_packs_are_valid() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/packs");
+        let mut names = Vec::new();
+        for entry in std::fs::read_dir(&root).unwrap() {
+            let pack = Pack::at(&entry.unwrap().path()).unwrap();
+            pack.check().unwrap();
+            let manifest: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(pack.dir.join(MANIFEST)).unwrap())
+                    .unwrap();
+            assert_eq!(manifest["name"], pack.name.as_str(), "{}", pack.name);
+            let hooks = pack.dir.join("hooks/hooks.json");
+            if hooks.is_file() {
+                let _: serde_json::Value =
+                    serde_json::from_str(&std::fs::read_to_string(hooks).unwrap()).unwrap();
+            }
+            let rules = pack.rules().unwrap().unwrap_or_default();
+            for skill in std::fs::read_dir(pack.dir.join("skills")).unwrap() {
+                let skill = skill.unwrap().file_name().into_string().unwrap();
+                assert!(
+                    rules.contains(&format!("`{}:{skill}`", pack.name)),
+                    "{}'s rules.md doesn't point at its {skill} skill",
+                    pack.name
+                );
+            }
+            names.push(pack.name);
+        }
+        names.sort();
+        assert_eq!(names, ["rust", "terraform-azure"]);
+    }
+
     #[test]
     fn a_pack_must_be_a_plugin_directory() {
         let dir = tempfile::tempdir().unwrap();

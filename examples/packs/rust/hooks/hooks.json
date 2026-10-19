@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -c 'import json,sys; print(json.load(sys.stdin).get(\"tool_input\",{}).get(\"file_path\",\"\"))' | { read -r file; case \"$file\" in *.rs) command -v cargo >/dev/null 2>&1 && cd \"$(dirname \"$file\")\" && cargo fmt --quiet >/dev/null 2>&1 || true ;; esac; }"
+          }
+        ]
+      }
+    ]
+  }
+}

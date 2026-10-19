@@ -92,6 +92,8 @@ impl Scheduler {
             ));
         }
 
+        self.forget_unconfigured(&mut notes)?;
+
         let mut queues = Vec::new();
         for repo in &self.factory.config().repos {
             match self.look_at(&repo.slug, &mut notes).await {
@@ -145,6 +147,37 @@ impl Scheduler {
         }
 
         self.save(&queue, &notes)
+    }
+
+    /// Cancels the unfinished runs of repos taken out of the config, so
+    /// `dsf status` and the digest stop showing them. Local runs, which
+    /// may share a development machine's state directory, are left alone.
+    fn forget_unconfigured(&self, notes: &mut Vec<String>) -> Result<()> {
+        let config = self.factory.config();
+        let gone: Vec<store::Run> = self
+            .factory
+            .engine()
+            .store()?
+            .unfinished_runs()?
+            .into_iter()
+            .filter(|run| {
+                !run.repo.starts_with("local/")
+                    && !run
+                        .repo
+                        .parse::<RepoSlug>()
+                        .is_ok_and(|slug| config.repo(&slug).is_some())
+            })
+            .collect();
+        for run in gone {
+            self.factory
+                .engine()
+                .cancel(run.id, "its repo is no longer in the config")?;
+            notes.push(format!(
+                "{}#{}: run {} canceled, because its repo is no longer in the config",
+                run.repo, run.issue, run.id
+            ));
+        }
+        Ok(())
     }
 
     /// Records what this tick has seen and done so far, for `dsf status`.

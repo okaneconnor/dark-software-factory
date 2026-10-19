@@ -22,6 +22,15 @@ The toolchain is pinned in `rust-toolchain.toml`.
 
 ## Code rules
 
+Rust style follows the `rust` standards pack, imported here so Claude Code
+applies it when working on this repo:
+
+@examples/packs/rust/rules.md
+
+Its skill has the reference pages (`examples/packs/rust/skills/rust/`); when
+running Claude Code here, add it with `--plugin-dir examples/packs/rust`.
+The rules below are dsf's own on top.
+
 - Lints are workspace-wide (`Cargo.toml`). `unsafe` is forbidden, and `unwrap`/`expect` are denied outside tests. Return errors instead.
 - Errors: `thiserror` types in `dsf-core`, `anyhow` with context at the binary's edges.
 - New behaviour comes with tests. Use unit tests in `dsf-core`, `insta` snapshots for rendered output (prompts, PR bodies, cards, HTML), and `assert_cmd` for the CLI.
