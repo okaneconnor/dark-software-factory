@@ -20,3 +20,7 @@ allow = ["registry.terraform.io", "releases.hashicorp.com"]
 ```
 
 The worker image includes Terraform, pinned in `worker/Dockerfile`.
+
+For conventions beyond what verify checks, give the repo the
+`terraform-azure` standards pack (`examples/packs/terraform-azure`), or your
+own, in the config's `packs`.

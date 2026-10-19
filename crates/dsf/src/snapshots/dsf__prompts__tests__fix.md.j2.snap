@@ -46,6 +46,7 @@ Add a regression test.
 
 Fix the cause, not the symptom: don't delete or weaken tests to make them pass. The same rules apply as before:
 
+- Follow the repository's instructions and any standards in your system prompt, as the original change had to.
 - Don't modify .factory/, .github/, .claude/, .mcp.json. Any change there stops the run.
 - Don't commit, push or change git configuration. The factory records your changes itself.
 

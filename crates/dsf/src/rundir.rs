@@ -91,6 +91,12 @@ impl RunDir {
         self.root.join("factory")
     }
 
+    /// The repository's instructions for agents, as read from the base
+    /// commit when the run started.
+    pub fn instructions(&self) -> PathBuf {
+        self.root.join("instructions.md")
+    }
+
     pub fn scratch(&self) -> PathBuf {
         self.root.join("scratch")
     }

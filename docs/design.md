@@ -6,7 +6,7 @@
 
 dsf turns GitHub issues that a trusted human has approved into verified **draft** pull requests, unattended, inside a time window (by default overnight). It replaces a prototype made of a Python orchestrator, a bash worker entrypoint and a digest script. The prototype proved the idea, but it left the GitHub token inside the agent's container, retried from scratch after any interruption, and had no way to stage or gate the work.
 
-dsf is deliberately small and single-user. The reference design is [Fabro](https://github.com/fabro-sh/fabro). dsf takes its patterns, not its code (§9).
+dsf is deliberately small and single-user. §9 lists the design choices it makes and what it deliberately leaves out.
 
 ## 2. Fixed decisions
 
@@ -37,7 +37,7 @@ A tick is one pass over everything dsf looks after, and it keeps nothing in memo
 - **Doctor** (`dsf doctor`). A preflight run once at deployment and whenever something looks wrong, as the same user and with the same credentials as a tick.
 - **Board.** A separate, read-only service on `127.0.0.1`, exposed by the operator if wanted (e.g. `tailscale serve`). It never holds the GitHub key or the Claude token.
 
-Fabro runs a long-lived server with its own scheduler loop, because it serves an API to many users. dsf is one person's overnight batch job, which is what timers are for: there is less to go wrong, `systemctl list-timers` and `journalctl` show what happened, and stopping the timer is an off switch. [`examples/systemd/`](../examples/systemd/) has the units.
+A long-lived server with its own scheduler loop suits a service that answers many users. dsf is one person's overnight batch job, which is what timers are for: there is less to go wrong, `systemctl list-timers` and `journalctl` show what happened, and stopping the timer is an off switch. [`examples/systemd/`](../examples/systemd/) has the units.
 
 CLI commands for operators and development:
 
@@ -240,7 +240,8 @@ The controls below are what make dsf safe to leave running unattended. [`CLAUDE.
   - extra egress hosts (the Anthropic API is always allowed);
   - the worker image;
   - extra protected paths;
-  - the state directory, how long a plan waits for approval (default 3 days), and the weekly usage cap (default 80%; 100 leaves it to the real limit).
+  - the state directory, how long a plan waits for approval (default 3 days), and the weekly usage cap (default 80%; 100 leaves it to the real limit);
+  - where standards packs live, and which each repo uses.
 
   Unknown keys are errors, so a secret pasted into the wrong place is rejected rather than silently kept. Secrets are files: under systemd, `$CREDENTIALS_DIRECTORY/claude-oauth-token`, `$CREDENTIALS_DIRECTORY/github-app.pem` and, optionally, `$CREDENTIALS_DIRECTORY/digest-webhook-url`; otherwise the same names in `~/.config/dsf/`.
 
@@ -251,6 +252,11 @@ The controls below are what make dsf safe to leave running unattended. [`CLAUDE.
   4. Run `dsf labels init owner/repo` for each repo, which also checks the app is installed there.
 
 - **Preparing a target repo.** Each configured repo needs a `.factory/verify.sh` that exits 0 when the work is done, a `CLAUDE.md` with its conventions, branch protection on the default branch, and the GitHub App installed; `dsf doctor` checks the first and last. Verify runs with no network unless the repo's `.factory/workflow.toml` gives it the proxy. [`examples/target-repos/`](../examples/target-repos/) has kits to copy; the Terraform one runs `fmt`, `validate` and mock-provider `terraform test`, never a plan or apply, and needs `registry.terraform.io` and `releases.hashicorp.com` in `[egress] allow`.
+- **Standards for agents.** Agents run Claude Code in restricted mode, which loads no `CLAUDE.md`, rules, skills, hooks or settings from the repository or from HOME. That keeps a repository from planting hooks, but it also means a repo's own conventions never reach the agent unless dsf delivers them. Tested with Claude Code 2.1.292: under restricted mode, only what dsf passes on the command line counts. So dsf delivers two things itself.
+  - **The repository's instructions.** `AGENTS.md`, `CLAUDE.md`, `.claude/CLAUDE.md` and `.claude/rules/*.md` are read from git objects at the run's base commit, never followed through symlinks, and saved with the run. Every agent stage gets them in its system prompt (`--append-system-prompt-file`), up to 32 KB. An agent's edits to them can't change what later stages are told.
+  - **Standards packs.** These are chosen by the operator: `[packs] dir` in the config, and `packs = [...]` per repo. A pack is an ordinary Claude Code plugin directory (`.claude-plugin/plugin.json`, `skills/`, `hooks/hooks.json`) with an optional `rules.md`. The rules join the system prompt; the plugin is mounted read-only and passed with `--plugin-dir`, so its skills reach the agent through the Skill tool and its hooks run (for example, formatting after every edit). It is also passed with `--add-dir`, because restricted mode lets file tools read only working directories, and a skill's reference pages sit beside its `SKILL.md`. A repository can't choose packs, because hooks run commands.
+
+  The review stage checks a change against these, quoting the rule a finding breaks. It scores each finding's confidence from 0 to 100, reports only those at 80 or more, and leaves anything verify would catch to verify. Because packs are standard plugins, they work in an interactive `claude --plugin-dir` too. [`examples/packs/terraform-azure`](../examples/packs/terraform-azure/) is one to copy, and `dsf run --local … --pack <dir>` tries a pack locally. `dsf doctor` checks that each repo's packs exist and are plugins.
 - **Setting up the digest (optional).** Without a webhook the digest is printed, which under systemd means the journal (`journalctl -u dsf-digest`). To have it posted instead, create an incoming webhook in either:
   - **Slack:** at [api.slack.com/apps](https://api.slack.com/apps), choose *Create New App* → *From scratch*. Turn on *Incoming Webhooks*, then *Add New Webhook to Workspace* and pick a channel. The URL starts `https://hooks.slack.com/services/`.
   - **Microsoft Teams:** in the channel, *Workflows* → *Post to a channel when a webhook request is received*.
@@ -270,7 +276,8 @@ worker/Dockerfile     agent and verify image: Node, pinned Claude Code, git, mak
 docker/dsf.Dockerfile dsf built from source, for the proxy sidecar in development and tests
 docker/release.Dockerfile  the released dsf image: the release binary on Debian slim
 .github/workflows/    ci.yml (the gate and cargo-deny), release.yml (tags → releases)
-examples/             config, systemd units, and kits for target repos (examples/target-repos/)
+examples/             config, systemd units, kits for target repos (examples/target-repos/)
+                      and standards packs (examples/packs/)
 docs/                 this document and operations notes
 .factory/verify.sh    the gate; also what CI runs
 ```
@@ -288,9 +295,9 @@ docs/                 this document and operations notes
 
 **Releases.** Pushing a tag `vX.Y.Z` that matches the crate version runs `release.yml`. It builds a static `x86_64-unknown-linux-musl` binary and publishes it as `dsf-vX.Y.Z-x86_64-unknown-linux-musl.tar.gz` with a `.sha256` file. It also pushes two images to GHCR, both tagged with the version: `dsf`, the same binary on Debian slim, which runs the proxy sidecar; and `dsf-worker`, with Claude Code pinned in `worker/Dockerfile`. The release notes list both image digests, which go into the config's `[images]`; dsf never pulls, so a deployment runs exactly the images it was given. Pull requests that change the packaging build all of this without publishing. The build and publish steps are separate jobs, and only the publish job, on a tag, can write.
 
-## 9. What comes from Fabro, and what doesn't
+## 9. Design choices
 
-**Adopted:**
+**Chosen:**
 - Outcome-routed stages with visit caps.
 - Bounded verify→fix loops and a repeat-failure breaker.
 - Fail-closed human gates.
@@ -303,11 +310,11 @@ docs/                 this document and operations notes
 - Scripted fake agents and snapshot tests.
 - A scheduler that decides from the clock it is given, so tests can say when "now" is.
 
-**Deliberately not adopted:**
+**Deliberately left out:**
 
-| Not adopted | Why |
+| Left out | Why |
 |---|---|
-| The DOT/Petri graph engine | A TOML stage graph is enough |
+| A general-purpose graph engine | A TOML stage graph is enough |
 | Multi-provider model routing and failover | One subscription, so pausing on limits is the right behaviour |
 | Cloud sandboxes | Out of scope |
 | Multi-user auth and a GitHub App wizard | Single user |

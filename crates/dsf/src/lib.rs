@@ -9,6 +9,7 @@ pub mod factory;
 pub mod github;
 pub mod hostgit;
 pub mod masker;
+pub mod packs;
 pub mod prompts;
 pub mod proxy;
 pub mod rundir;

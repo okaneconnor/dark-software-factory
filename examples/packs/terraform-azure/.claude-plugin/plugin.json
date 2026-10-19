@@ -1,0 +1,6 @@
+{
+  "name": "terraform-azure",
+  "version": "0.1.0",
+  "description": "Conventions for Terraform on Azure: naming, tags, variables, mock-provider tests, Container Apps, security defaults, and terraform fmt after every edit.",
+  "license": "MIT"
+}

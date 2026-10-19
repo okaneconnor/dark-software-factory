@@ -62,6 +62,20 @@ case "$stage:$action" in
       exit 1
     fi
     fix_calc ;;
+  *:record-context)
+    # What dsf gave this agent beyond its prompt, for the packs test.
+    fix_calc
+    {
+      before=""
+      for arg in "$@"; do
+        case "$before" in --tools|--append-system-prompt-file|--plugin-dir|--add-dir) echo "$before $arg" ;; esac
+        before="$arg"
+      done
+      echo "--- /dsf/system.md"
+      cat /dsf/system.md 2>/dev/null
+      echo "--- /dsf/packs"
+      ls /dsf/packs 2>/dev/null
+    } > context.txt ;;
   *:fail)
     emit '{"type":"result","subtype":"error_during_execution","is_error":true}'
     exit 1 ;;

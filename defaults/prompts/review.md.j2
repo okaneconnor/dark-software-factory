@@ -27,8 +27,25 @@ The change:
 {{ diff }}
 </diff>
 
-Check that it does what the issue asks, that it is correct, and that it doesn't weaken or delete tests to get them passing. Then return:
+Review it the way a careful senior engineer would, in four passes:
 
-- `outcome`: `approve`, or `changes_requested` if something must change before a human reviews it.
-- `summary`: your assessment in a few sentences.
-- `issues`: for `changes_requested`, each problem, specific enough to act on.
+1. **The issue.** Does the change do what the issue asks, and nothing it doesn't?
+2. **Bugs.** Read the changed code and what it touches. Look for real defects: wrong behaviour, broken edge cases, security problems.
+3. **The rules.** Check the change against the repository's instructions and any standards in your system prompt, and against any standards pack skills that cover it. Only flag a breach you can quote the rule for.
+4. **Tests.** Make sure no test was weakened or deleted to get them passing.
+
+For every possible problem, score your confidence that it is real and matters, from 0 to 100:
+
+- 0: doesn't survive a second look, or was already there before this change.
+- 25: might be real; you couldn't confirm it. A style point no rule calls for.
+- 50: real but minor, or unlikely to happen in practice.
+- 75: verified, and it will be hit in practice, or a rule calls it out directly.
+- 100: certain, and the evidence shows it directly.
+
+Report only problems scoring 80 or more. Leave out anything verify, a linter or a type checker would catch, pre-existing problems, nitpicks, and lines this change didn't touch. If nothing scores 80, approve.
+
+Return:
+
+- `outcome`: `approve`, or `changes_requested` if any problem scores 80 or more.
+- `summary`: your assessment in a few sentences, saying which rules you checked the change against.
+- `issues`: for `changes_requested`, one entry per problem: what is wrong and where, the rule or evidence (quote the rule), what to change, and your score, e.g. `variables.tf: max_replicas has no validation (CLAUDE.md: "a validation block where bad input is likely"); add one limiting it to 0-10. Confidence 85.`

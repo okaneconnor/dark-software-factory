@@ -11,6 +11,7 @@ use dsf_core::config::{Config, RepoSlug};
 use dsf_core::labels;
 
 use crate::github::GitHub;
+use crate::packs::Pack;
 use crate::sandbox::Sandbox;
 use crate::store::Store;
 
@@ -164,6 +165,62 @@ pub fn state_dir(dir: &Path) -> Check {
         );
     }
     Check::new(Level::Ok, subject, format!("{shown}, database ready"))
+}
+
+/// Each repo's standards packs: there, and usable as Claude Code plugins.
+pub fn packs(config: &Config) -> Vec<Check> {
+    let Some(dir) = &config.packs_dir else {
+        return Vec::new();
+    };
+    config
+        .repos
+        .iter()
+        .filter(|repo| !repo.packs.is_empty())
+        .map(|repo| {
+            let subject = format!("{} packs", repo.slug);
+            let mut found = Vec::new();
+            let mut problems = Vec::new();
+            for name in &repo.packs {
+                let pack = Pack::named(dir, name);
+                match pack.check() {
+                    Ok(()) => found.push(describe(&pack)),
+                    Err(error) => problems.push(format!("{error:#}")),
+                }
+            }
+            if problems.is_empty() {
+                Check::new(Level::Ok, subject, found.join(", "))
+            } else {
+                Check::new(Level::Fail, subject, problems.join("; "))
+            }
+        })
+        .collect()
+}
+
+/// e.g. `terraform-azure (rules, 2 skills, hooks)`.
+fn describe(pack: &Pack) -> String {
+    let skills = std::fs::read_dir(pack.dir.join("skills")).map_or(0, |entries| {
+        entries
+            .filter_map(Result::ok)
+            .filter(|e| e.path().join("SKILL.md").is_file())
+            .count()
+    });
+    let mut parts = Vec::new();
+    if pack.dir.join(crate::packs::RULES_FILE).is_file() {
+        parts.push("rules".to_owned());
+    }
+    match skills {
+        0 => {}
+        1 => parts.push("1 skill".to_owned()),
+        n => parts.push(format!("{n} skills")),
+    }
+    if pack.dir.join("hooks/hooks.json").is_file() {
+        parts.push("hooks".to_owned());
+    }
+    if parts.is_empty() {
+        pack.name.clone()
+    } else {
+        format!("{} ({})", pack.name, parts.join(", "))
+    }
 }
 
 /// The GitHub App, and what it can see of each configured repo.
@@ -326,6 +383,54 @@ mod tests {
         assert!(dir.path().join("dsf.sqlite").is_file());
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(state_dir(dir.path()).level, Level::Warn);
+    }
+
+    #[test]
+    fn packs_are_checked_and_described() {
+        let dir = tempfile::tempdir().unwrap();
+        let pack = dir.path().join("terraform-azure");
+        std::fs::create_dir_all(pack.join(".claude-plugin")).unwrap();
+        std::fs::write(pack.join(".claude-plugin/plugin.json"), "{}").unwrap();
+        std::fs::write(pack.join("rules.md"), "x").unwrap();
+        for skill in ["naming", "testing"] {
+            std::fs::create_dir_all(pack.join("skills").join(skill)).unwrap();
+            std::fs::write(pack.join("skills").join(skill).join("SKILL.md"), "x").unwrap();
+        }
+        std::fs::create_dir_all(pack.join("hooks")).unwrap();
+        std::fs::write(pack.join("hooks/hooks.json"), "{}").unwrap();
+        let config = Config::parse(&format!(
+            r#"
+            timezone = "Europe/London"
+            [packs]
+            dir = "{}"
+            [github]
+            allowed_users = ["octocat"]
+            [[repos]]
+            name = "octo/good"
+            packs = ["terraform-azure"]
+            [[repos]]
+            name = "octo/bad"
+            packs = ["missing"]
+            [[repos]]
+            name = "octo/none"
+            [images]
+            worker = "w"
+            "#,
+            dir.path().display()
+        ))
+        .unwrap();
+        let checks = packs(&config);
+        assert_eq!(checks.len(), 2);
+        assert_eq!(
+            (checks[0].level, checks[0].detail.as_str()),
+            (Level::Ok, "terraform-azure (rules, 2 skills, hooks)")
+        );
+        assert_eq!(checks[1].level, Level::Fail);
+        assert!(
+            checks[1].detail.contains("doesn't exist"),
+            "{:?}",
+            checks[1]
+        );
     }
 
     #[test]

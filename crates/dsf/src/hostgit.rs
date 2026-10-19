@@ -435,6 +435,39 @@ impl HostGit {
         Ok(refusals)
     }
 
+    /// The repository's instructions for agents as they are in `sha`, in
+    /// the order Claude Code reads them: `AGENTS.md`, `CLAUDE.md`,
+    /// `.claude/CLAUDE.md`, then `.claude/rules/*.md`. Only regular files
+    /// count; a symlink is never followed.
+    pub async fn instruction_files(&self, sha: &Sha) -> Result<Vec<(String, Vec<u8>)>> {
+        const TOP: [&str; 3] = ["AGENTS.md", "CLAUDE.md", ".claude/CLAUDE.md"];
+        let mut wanted: Vec<TreeEntry> = self
+            .ls_tree(sha, None)
+            .await?
+            .into_iter()
+            .filter(|entry| matches!(entry.mode.as_str(), "100644" | "100755"))
+            .filter(|entry| {
+                TOP.contains(&entry.path.as_str())
+                    || (entry.path.starts_with(".claude/rules/")
+                        && Path::new(&entry.path)
+                            .extension()
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("md")))
+            })
+            .collect();
+        let rank = |path: &str| TOP.iter().position(|top| *top == path).unwrap_or(TOP.len());
+        wanted.sort_by(|a, b| {
+            rank(&a.path)
+                .cmp(&rank(&b.path))
+                .then_with(|| a.path.cmp(&b.path))
+        });
+        let mut files = Vec::new();
+        for entry in wanted {
+            let contents = self.blob(&entry.oid).await?;
+            files.push((entry.path, contents));
+        }
+        Ok(files)
+    }
+
     /// Writes `.factory/` as it is in `sha` into `dest`, from git objects.
     /// Refuses symlinks and submodules there: either could make the gate
     /// run something the agent can edit.

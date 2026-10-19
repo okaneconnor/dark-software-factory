@@ -34,6 +34,13 @@ pub struct Invocation<'a> {
     pub model: &'a str,
     pub schema: Option<Schema>,
     pub max_turns: u32,
+    /// A file, inside the container, appended to the system prompt: the
+    /// repository's instructions and the packs' rules.
+    pub system_prompt_file: Option<&'a str>,
+    /// Standards packs, as plugin directories inside the container.
+    pub plugin_dirs: &'a [String],
+    /// Whether the packs have skills, which need the Skill tool.
+    pub skills: bool,
 }
 
 /// The argv for `claude` in an agent container. Every stage runs
@@ -61,19 +68,33 @@ pub fn command_line(invocation: &Invocation<'_>) -> Result<Vec<String>> {
     .map(str::to_owned)
     .into();
     argv.push(invocation.max_turns.to_string());
-    match invocation.mode {
-        AgentMode::Read => argv.extend(["--tools", READ_TOOLS].map(str::to_owned)),
-        AgentMode::Write => argv.extend(
-            [
-                "--tools",
-                WRITE_TOOLS,
-                "--permission-mode",
-                "acceptEdits",
-                "--allowedTools",
-                "Bash",
-            ]
-            .map(str::to_owned),
-        ),
+    let tools = match invocation.mode {
+        AgentMode::Read => READ_TOOLS,
+        AgentMode::Write => WRITE_TOOLS,
+    };
+    argv.push("--tools".to_owned());
+    argv.push(if invocation.skills {
+        format!("{tools},Skill")
+    } else {
+        tools.to_owned()
+    });
+    if invocation.mode == AgentMode::Write {
+        argv.extend(
+            ["--permission-mode", "acceptEdits", "--allowedTools", "Bash"].map(str::to_owned),
+        );
+    }
+    if let Some(file) = invocation.system_prompt_file {
+        argv.push("--append-system-prompt-file".to_owned());
+        argv.push(file.to_owned());
+    }
+    // A pack is a plugin, and also a directory the agent may read: restricted
+    // mode confines file tools to working directories, and a skill's
+    // reference pages live beside its SKILL.md. Packs are mounted read-only.
+    for dir in invocation.plugin_dirs {
+        for flag in ["--plugin-dir", "--add-dir"] {
+            argv.push(flag.to_owned());
+            argv.push(dir.clone());
+        }
     }
     if let Some(schema) = invocation.schema {
         argv.push("--json-schema".to_owned());
@@ -411,6 +432,9 @@ mod tests {
             model: "claude-sonnet-5-5",
             schema: Some(Schema::Plan),
             max_turns: 30,
+            system_prompt_file: None,
+            plugin_dirs: &[],
+            skills: false,
         })
         .unwrap();
         let tools = argv.iter().position(|a| a == "--tools").unwrap();
@@ -436,11 +460,50 @@ mod tests {
             model: "claude-sonnet-5-5",
             schema: None,
             max_turns: 60,
+            system_prompt_file: None,
+            plugin_dirs: &[],
+            skills: false,
         })
         .unwrap()
         .join(" ");
         assert!(argv.contains("--tools Read,Grep,Glob,Edit,Write,Bash --permission-mode acceptEdits --allowedTools Bash"));
         assert!(!argv.contains("--json-schema"));
+        assert!(!argv.contains("--plugin-dir") && !argv.contains("--append-system-prompt-file"));
+    }
+
+    #[test]
+    fn packs_arrive_as_plugins_with_the_skill_tool() {
+        let packs = [
+            "/dsf/packs/terraform-azure".to_owned(),
+            "/dsf/packs/house".to_owned(),
+        ];
+        let argv = command_line(&Invocation {
+            mode: AgentMode::Read,
+            prompt: "review it",
+            model: "claude-sonnet-5-5",
+            schema: Some(Schema::Review),
+            max_turns: 20,
+            system_prompt_file: Some("/dsf/system.md"),
+            plugin_dirs: &packs,
+            skills: true,
+        })
+        .unwrap();
+        let tools = argv.iter().position(|a| a == "--tools").unwrap();
+        assert_eq!(argv[tools + 1], "Read,Grep,Glob,Skill");
+        let joined = argv.join(" ");
+        assert!(
+            joined.contains("--append-system-prompt-file /dsf/system.md"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains(
+                "--plugin-dir /dsf/packs/terraform-azure --add-dir /dsf/packs/terraform-azure \
+                 --plugin-dir /dsf/packs/house --add-dir /dsf/packs/house"
+            ),
+            "{joined}"
+        );
+        // Still nothing after the prompt.
+        assert_eq!(argv.last().unwrap(), "review it");
     }
 
     #[test]
@@ -452,6 +515,9 @@ mod tests {
             model: "m",
             schema: None,
             max_turns: 1,
+            system_prompt_file: None,
+            plugin_dirs: &[],
+            skills: false,
         };
         assert!(command_line(&invocation).is_err());
     }
