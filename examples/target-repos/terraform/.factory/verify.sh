@@ -1,5 +1,6 @@
 #!/bin/sh
-# dsf's definition of done for a Terraform root module. It never plans or
+# dsf's definition of done for a Terraform root module: formatted, valid,
+# lint-clean against .factory/tflint.hcl, and tested. It never plans or
 # applies: dsf holds no cloud credentials, so tests use mock providers.
 set -eu
 
@@ -10,6 +11,7 @@ fi
 terraform fmt -check -recursive -diff
 terraform init -backend=false -input=false -no-color
 terraform validate -no-color
+tflint --config "$PWD/.factory/tflint.hcl" --format compact --no-color
 if ls tests/*.tftest.hcl >/dev/null 2>&1; then
     terraform test -no-color
 fi
