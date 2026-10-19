@@ -1,0 +1,6 @@
+{
+  "name": "rust",
+  "version": "0.1.0",
+  "description": "Rust conventions: errors, types and APIs, ownership, async, testing, lints and documentation, with cargo fmt after every edit.",
+  "license": "MIT"
+}
