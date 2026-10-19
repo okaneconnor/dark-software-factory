@@ -1,7 +1,7 @@
 //! The operator's configuration file, conventionally `/etc/dsf/config.toml`.
 //!
 //! Secrets never live here. The Claude token, the GitHub App's private key
-//! and the Teams webhook come from files or systemd credentials, so this
+//! and the digest webhook come from files or systemd credentials, so this
 //! file can be world-readable and kept in version control.
 
 use std::fmt;

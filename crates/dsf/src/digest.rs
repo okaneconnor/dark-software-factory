@@ -1,7 +1,7 @@
 //! The morning digest: what the factory finished since the last digest,
 //! what's waiting on a person, and where things stand. Built from the
-//! store alone, then posted to a Teams channel as an Adaptive Card or, with
-//! no webhook, printed for the journal.
+//! store alone, then posted to a Slack or Teams channel through an incoming
+//! webhook or, with none, printed for the journal.
 
 use std::fmt::Write as _;
 use std::time::Duration;
@@ -28,6 +28,35 @@ const MAX_LOOKBACK: SignedDuration = SignedDuration::from_hours(7 * 24);
 /// timer has stopped.
 const STALE_TICK: SignedDuration = SignedDuration::from_hours(1);
 const POST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Slack's limits on a section's text and a header's.
+const SLACK_SECTION_MAX: usize = 3000;
+const SLACK_HEADER_MAX: usize = 150;
+
+/// Where a webhook delivers the digest, told apart by its host: Slack's
+/// incoming webhooks all live on one, and anything else is taken to be a
+/// Teams Workflows webhook.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Channel {
+    Slack,
+    Teams,
+}
+
+impl Channel {
+    pub fn of(webhook: &Url) -> Self {
+        if webhook.host_str() == Some("hooks.slack.com") {
+            Self::Slack
+        } else {
+            Self::Teams
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Slack => "Slack",
+            Self::Teams => "Teams",
+        }
+    }
+}
 
 pub struct Digest {
     since: Timestamp,
@@ -214,6 +243,46 @@ impl Summary {
         out
     }
 
+    /// The message `channel`'s webhook expects.
+    pub fn message(&self, channel: Channel) -> Value {
+        match channel {
+            Channel::Slack => self.slack(),
+            Channel::Teams => self.card(),
+        }
+    }
+
+    /// A Slack incoming-webhook message in Block Kit. `text` is what
+    /// notifications show.
+    pub fn slack(&self) -> Value {
+        let mut blocks = vec![
+            json!({"type": "header", "text": {"type": "plain_text", "text": clip(&self.title, SLACK_HEADER_MAX)}}),
+            json!({"type": "context", "elements": [{"type": "mrkdwn", "text": slack_escape(&self.period)}]}),
+        ];
+        for warning in &self.warnings {
+            blocks.push(json!({"type": "section", "text": {"type": "mrkdwn", "text": format!(":warning: {}", slack_escape(warning))}}));
+        }
+        for section in &self.sections {
+            let mut text = format!("*{}* ({})", section.title, section.items.len());
+            for item in &section.items {
+                let issue = slack_escape(&item.issue);
+                let line = match (item.issue.is_empty(), &item.link) {
+                    (true, _) => slack_escape(&item.text),
+                    (false, Some(link)) => format!("<{link}|{issue}> {}", slack_escape(&item.text)),
+                    (false, None) => format!("{issue} {}", slack_escape(&item.text)),
+                };
+                let _ = write!(text, "\n• {line}");
+            }
+            blocks.push(json!({"type": "section", "text": {"type": "mrkdwn", "text": clip(&text, SLACK_SECTION_MAX)}}));
+        }
+        let fields: Vec<Value> = self
+            .facts
+            .iter()
+            .map(|(name, value)| json!({"type": "mrkdwn", "text": format!("*{name}*\n{}", slack_escape(value))}))
+            .collect();
+        blocks.push(json!({"type": "section", "fields": fields}));
+        json!({"text": self.title, "blocks": blocks})
+    }
+
     /// The message a Teams Workflows webhook expects: one Adaptive Card.
     pub fn card(&self) -> Value {
         let mut body = vec![
@@ -264,9 +333,11 @@ impl Summary {
     }
 }
 
-/// Posts `card` to a Teams Workflows webhook. The URL is a secret, so it
-/// never appears in an error.
-pub async fn post(webhook: &Url, card: &Value) -> Result<()> {
+/// Posts the digest to a Slack or Teams webhook, in the form that one
+/// expects. The URL is a secret, so it never appears in an error.
+pub async fn post(webhook: &Url, summary: &Summary) -> Result<Channel> {
+    let channel = Channel::of(webhook);
+    let to = channel.name();
     crate::github::install_crypto();
     let client = reqwest::Client::builder()
         .user_agent(concat!("dsf/", env!("CARGO_PKG_VERSION")))
@@ -276,24 +347,41 @@ pub async fn post(webhook: &Url, card: &Value) -> Result<()> {
         .build()?;
     let response = client
         .post(webhook.clone())
-        .json(card)
+        .json(&summary.message(channel))
         .send()
         .await
-        .map_err(|error| anyhow!("posting the digest to Teams: {}", error.without_url()))?;
+        .map_err(|error| anyhow!("posting the digest to {to}: {}", error.without_url()))?;
     let status = response.status();
     if !status.is_success() {
-        bail!("posting the digest to Teams: the webhook answered {status}");
+        bail!("posting the digest to {to}: the webhook answered {status}");
     }
-    Ok(())
+    Ok(channel)
 }
 
 /// A webhook URL from its credential file, refused unless it's HTTPS.
 pub fn webhook_url(text: &str) -> Result<Url> {
-    let url = Url::parse(text.trim()).map_err(|_| anyhow!("the Teams webhook is not a URL"))?;
+    let url = Url::parse(text.trim()).map_err(|_| anyhow!("the digest webhook is not a URL"))?;
     if url.scheme() != "https" {
-        bail!("the Teams webhook must be an https:// URL");
+        bail!("the digest webhook must be an https:// URL");
     }
     Ok(url)
+}
+
+/// Slack's mrkdwn treats these three as markup.
+fn slack_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// At most `max` characters, ending in an ellipsis if cut.
+fn clip(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_owned();
+    }
+    let mut clipped: String = text.chars().take(max - 1).collect();
+    clipped.push('…');
+    clipped
 }
 
 fn issue_ref(run: &Run) -> String {
@@ -468,6 +556,10 @@ mod tests {
             "card",
             serde_json::to_string_pretty(&summary.card()).unwrap()
         );
+        insta::assert_snapshot!(
+            "slack",
+            serde_json::to_string_pretty(&summary.slack()).unwrap()
+        );
     }
 
     #[test]
@@ -508,10 +600,50 @@ mod tests {
         let plain = webhook_url("http://example.invalid/x").unwrap_err();
         assert_eq!(
             plain.to_string(),
-            "the Teams webhook must be an https:// URL"
+            "the digest webhook must be an https:// URL"
         );
         let junk = webhook_url("sig=secret-value").unwrap_err().to_string();
         assert!(!junk.contains("secret-value"), "{junk}");
+    }
+
+    #[test]
+    fn slack_webhooks_get_slack_messages() {
+        let url = |text: &str| Url::parse(text).unwrap();
+        assert_eq!(
+            Channel::of(&url("https://hooks.slack.com/services/T0/B0/x")),
+            Channel::Slack
+        );
+        assert_eq!(
+            Channel::of(&url(
+                "https://prod-1.westeurope.logic.azure.com/workflows/x"
+            )),
+            Channel::Teams
+        );
+        let summary = Summary {
+            title: "dsf: 1 blocked".to_owned(),
+            period: "Since Mon".to_owned(),
+            warnings: Vec::new(),
+            sections: vec![Section {
+                title: "Blocked",
+                items: vec![Item {
+                    issue: "octo/calc#1".to_owned(),
+                    link: Some("https://github.com/octo/calc/issues/1".to_owned()),
+                    text: "Fix <b> & co: x".to_owned(),
+                }],
+            }],
+            facts: vec![("Usage", "a > b".to_owned())],
+        };
+        let message = summary.message(Channel::Slack);
+        assert_eq!(message["text"], "dsf: 1 blocked");
+        assert_eq!(
+            message["blocks"][2]["text"]["text"],
+            "*Blocked* (1)\n• <https://github.com/octo/calc/issues/1|octo/calc#1> Fix &lt;b&gt; &amp; co: x"
+        );
+        assert_eq!(
+            message["blocks"][3]["fields"][0]["text"],
+            "*Usage*\na &gt; b"
+        );
+        assert_eq!(clip(&"x".repeat(10), 5), "xxxx…");
     }
 
     #[tokio::test]
@@ -531,18 +663,17 @@ mod tests {
             .respond_with(ResponseTemplate::new(403))
             .mount(&server)
             .await;
-        let card = Digest::load(&night(), at("2026-10-20T06:00:00Z"))
+        let summary = Digest::load(&night(), at("2026-10-20T06:00:00Z"))
             .unwrap()
-            .summarise(&config(), &london())
-            .card();
+            .summarise(&config(), &london());
 
         let accepted =
             Url::parse(&format!("{}/workflows/accepted?sig=s3cret", server.uri())).unwrap();
-        post(&accepted, &card).await.unwrap();
+        assert_eq!(post(&accepted, &summary).await.unwrap(), Channel::Teams);
 
         let refused =
             Url::parse(&format!("{}/workflows/refused?sig=s3cret", server.uri())).unwrap();
-        let error = post(&refused, &card).await.unwrap_err().to_string();
+        let error = post(&refused, &summary).await.unwrap_err().to_string();
         assert_eq!(
             error,
             "posting the digest to Teams: the webhook answered 403 Forbidden"
@@ -552,7 +683,7 @@ mod tests {
         let port = closed.local_addr().unwrap().port();
         drop(closed);
         let gone = Url::parse(&format!("http://127.0.0.1:{port}/workflows?sig=s3cret")).unwrap();
-        let error = post(&gone, &card).await.unwrap_err().to_string();
+        let error = post(&gone, &summary).await.unwrap_err().to_string();
         assert!(
             error.starts_with("posting the digest to Teams: "),
             "{error}"

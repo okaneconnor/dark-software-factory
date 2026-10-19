@@ -43,14 +43,15 @@ enum Command {
     /// Let claiming start again after a pause.
     Unpause(StateArgs),
     /// Send the morning digest: what finished since the last one, and what
-    /// is waiting. Posted to Teams when there's a webhook, otherwise printed.
+    /// is waiting. Posted to Slack or Teams when there's a webhook,
+    /// otherwise printed.
     Digest {
         /// Print it without posting or recording it.
         #[arg(long)]
         dry_run: bool,
-        /// A file holding the Teams Workflows webhook URL. Defaults to
-        /// `$CREDENTIALS_DIRECTORY/teams-webhook-url`, then
-        /// `~/.config/dsf/teams-webhook-url`, if either exists.
+        /// A file holding a Slack incoming-webhook or Teams Workflows URL.
+        /// Defaults to `$CREDENTIALS_DIRECTORY/digest-webhook-url`, then
+        /// `~/.config/dsf/digest-webhook-url`, if either exists.
         #[arg(long, value_name = "FILE")]
         webhook_file: Option<PathBuf>,
         #[command(flatten)]
@@ -595,7 +596,7 @@ fn digest(args: &StateArgs, webhook_file: Option<&Path>, dry_run: bool) -> Resul
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let webhook_file = match webhook_file {
         Some(file) => Some(file.to_owned()),
-        None => credential("teams-webhook-url", home.as_deref())
+        None => credential("digest-webhook-url", home.as_deref())
             .ok()
             .filter(|file| file.is_file()),
     };
@@ -603,8 +604,8 @@ fn digest(args: &StateArgs, webhook_file: Option<&Path>, dry_run: bool) -> Resul
         Some(file) => {
             let url = dsf::digest::webhook_url(&read(&file)?)?;
             let runtime = tokio::runtime::Runtime::new()?;
-            runtime.block_on(dsf::digest::post(&url, &summary.card()))?;
-            println!("posted the digest to Teams: {}", summary.title);
+            let channel = runtime.block_on(dsf::digest::post(&url, &summary))?;
+            println!("posted the digest to {}: {}", channel.name(), summary.title);
         }
         None => print!("{}", summary.text()),
     }
@@ -662,7 +663,7 @@ fn doctor(args: &WorkerArgs) -> Result<()> {
     let key_ok = key_check.level == Level::Ok;
     checks.push(key_check);
     checks.push(doctor::webhook_file(&credential(
-        "teams-webhook-url",
+        "digest-webhook-url",
         home,
     )?));
 

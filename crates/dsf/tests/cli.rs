@@ -467,7 +467,7 @@ async fn doctor_reports_each_problem_with_its_fix() {
         "ok    state directory: ".to_owned(),
         format!("FAIL  Claude token: {} is missing", token.display()),
         "ok    GitHub App key: ".to_owned(),
-        "note  Teams webhook: none, so the digest is printed to the journal".to_owned(),
+        "note  digest webhook: none, so the digest is printed to the journal".to_owned(),
         "ok    GitHub App: acting as dsf-test[bot]".to_owned(),
         "warn  octo/calc: missing labels factory:draft, factory:running".to_owned(),
     ] {
