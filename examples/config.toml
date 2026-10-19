@@ -1,6 +1,6 @@
 # Example dsf configuration, normally installed as /etc/dsf/config.toml.
 # Every value below is a placeholder. Secrets never go in this file: the
-# Claude token, the GitHub App's private key and the Teams webhook are
+# Claude token, the GitHub App's private key and the digest webhook are
 # separate files (see docs/design.md).
 # Check a config with `dsf config validate <file>`.
 

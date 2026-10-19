@@ -14,8 +14,8 @@ Group=factory
 ExecStart=/usr/local/bin/dsf doctor --config /etc/dsf/config.toml
 LoadCredential=claude-oauth-token:/etc/dsf/credentials/claude-oauth-token
 LoadCredential=github-app.pem:/etc/dsf/credentials/github-app.pem
-# Drop this line, as in dsf-digest.service, if there's no Teams webhook.
-LoadCredential=teams-webhook-url:/etc/dsf/credentials/teams-webhook-url
+# Drop this line, as in dsf-digest.service, if there's no digest webhook.
+LoadCredential=digest-webhook-url:/etc/dsf/credentials/digest-webhook-url
 TimeoutStartSec=5min
 NoNewPrivileges=yes
 PrivateTmp=yes

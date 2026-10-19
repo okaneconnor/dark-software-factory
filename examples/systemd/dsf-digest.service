@@ -9,9 +9,10 @@ Type=oneshot
 User=factory
 Group=factory
 ExecStart=/usr/local/bin/dsf digest --config /etc/dsf/config.toml
-# The Teams Workflows webhook URL. Without this line the digest is printed
+# A Slack incoming-webhook or Teams Workflows URL; the digest goes to
+# whichever it is. Without this line the digest is printed
 # to the journal instead (`journalctl -u dsf-digest`).
-LoadCredential=teams-webhook-url:/etc/dsf/credentials/teams-webhook-url
+LoadCredential=digest-webhook-url:/etc/dsf/credentials/digest-webhook-url
 TimeoutStartSec=5min
 NoNewPrivileges=yes
 PrivateTmp=yes

@@ -99,9 +99,9 @@ pub fn secret_file(subject: &str, path: &Path, optional: Option<&str>) -> Check 
     }
 }
 
-/// The Teams webhook file, if there is one: private, and an HTTPS URL.
+/// The digest webhook file, if there is one: private, and an HTTPS URL.
 pub fn webhook_file(path: &Path) -> Check {
-    let subject = "Teams webhook";
+    let subject = "digest webhook";
     let check = secret_file(
         subject,
         path,
@@ -114,10 +114,14 @@ pub fn webhook_file(path: &Path) -> Check {
         .map_err(anyhow::Error::from)
         .and_then(|text| crate::digest::webhook_url(&text))
     {
-        Ok(_) => Check::new(
+        Ok(url) => Check::new(
             Level::Ok,
             subject,
-            format!("{}; the digest is posted to Teams", path.display()),
+            format!(
+                "{}; the digest is posted to {}",
+                path.display(),
+                crate::digest::Channel::of(&url).name()
+            ),
         ),
         Err(error) => Check::new(Level::Fail, subject, format!("{}: {error}", path.display())),
     }
@@ -292,7 +296,7 @@ mod tests {
     #[test]
     fn the_webhook_is_optional_but_must_be_https() {
         let dir = tempfile::tempdir().unwrap();
-        let absent = webhook_file(&dir.path().join("teams-webhook-url"));
+        let absent = webhook_file(&dir.path().join("digest-webhook-url"));
         assert_eq!(absent.level, Level::Note);
         let plain = webhook_file(&write(
             dir.path(),

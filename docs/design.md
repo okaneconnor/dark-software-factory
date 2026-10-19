@@ -21,7 +21,7 @@ dsf is deliberately small and single-user. The reference design is [Fabro](https
 | Done | The target repo's `.factory/verify.sh` exits 0. Failures feed a bounded fix loop. |
 | Limits | A usage-limit hit requeues the issue and pauses claiming until the limit resets. So does reaching the weekly usage cap (default 80% of the weekly allowance), which leaves the rest for the operator's own use. |
 | Schedule | Claims only inside a configurable window (default 23:00–07:00 local wall-clock time; it may span midnight, and equal start and end mean always open); running work finishes. A systemd timer runs `dsf tick` every few minutes; there is no long-running daemon. One worker by default, maximum two. |
-| Reporting | A morning digest (default 07:00) to a Microsoft Teams Workflows webhook, or to stdout. |
+| Reporting | A morning digest (default 07:00) to a Slack incoming webhook or a Microsoft Teams Workflows webhook, or to stdout. |
 | v1 scope | Staged pipeline, per-repo workflows, optional plan-approval gate, read-only web runs board. |
 
 ## 3. Architecture
@@ -54,7 +54,7 @@ CLI commands for operators and development:
 | `dsf workflow default` | Print the built-in workflow, a starting point for a repo's own |
 | `dsf config validate <file>` | Validate a config file, including its time zone |
 | `dsf labels init` | Create the label set in configured repos |
-| `dsf digest [--dry-run]` | Send the digest: to Teams if a webhook is configured, otherwise to stdout. `--dry-run` prints it without sending or recording it. |
+| `dsf digest [--dry-run]` | Send the digest: to Slack or Teams if a webhook is configured, otherwise to stdout. `--dry-run` prints it without sending or recording it. |
 
 ## 4. Pipeline and per-repo workflows
 
@@ -231,7 +231,7 @@ The controls below are what make dsf safe to leave running unattended. [`CLAUDE.
 ## 7. Board, digest and configuration
 
 - **Board.** A separate read-only service: axum and server-rendered HTML (maud), refreshed by htmx polling every few seconds. It has no mutating routes, and every view is masked. Its overview is a kanban of the issue lifecycle (ready, running, awaiting approval, review and blocked) under the window and any pause or backoff; `dsf status` prints the same columns as text. Run detail shows the stage timeline, logs, diff stat and PR link, and there is a history page. Cards move only when a person relabels the issue on GitHub: the trust checks (§6.7) rely on knowing which human added a label, and a board that relabelled issues would act as the app.
-- **Digest.** Built from SQLite alone: the draft PRs opened, runs blocked or canceled with their reasons since the last digest (the first looks back a day, none more than a week), plans awaiting approval, runs in progress, the queue, the latest usage reading, and whether claiming is allowed. It warns when no tick has run for an hour, which means the timer has stopped, and when claiming is paused. It is posted to a Teams Workflows webhook as an Adaptive Card; the webhook URL is a secret, a credential file like the others, and never appears in an error. Without one, the digest is printed for the journal.
+- **Digest.** Built from SQLite alone: the draft PRs opened, runs blocked or canceled with their reasons since the last digest (the first looks back a day, none more than a week), plans awaiting approval, runs in progress, the queue, the latest usage reading, and whether claiming is allowed. It warns when no tick has run for an hour, which means the timer has stopped, and when claiming is paused. It is posted through an incoming webhook: to Slack in Block Kit when the URL is on `hooks.slack.com`, otherwise to a Teams Workflows webhook as an Adaptive Card. The webhook URL is a secret, a credential file (`digest-webhook-url`) like the others, and never appears in an error. Without one, the digest is printed for the journal.
 - **Configuration.** A single file, conventionally `/etc/dsf/config.toml`. [`examples/config.toml`](../examples/config.toml) documents every key with placeholder values, and `dsf config validate` checks a file. It sets:
   - the time zone, window (default 23:00–07:00) and worker count (1 or 2); how often a tick runs, and when the digest goes out, are the timers' settings;
   - repos and per-repo approval policy (`never`, `label` or `always`; default `label`);
@@ -242,13 +242,19 @@ The controls below are what make dsf safe to leave running unattended. [`CLAUDE.
   - extra protected paths;
   - the state directory, how long a plan waits for approval (default 3 days), and the weekly usage cap (default 80%; 100 leaves it to the real limit).
 
-  Unknown keys are errors, so a secret pasted into the wrong place is rejected rather than silently kept. Secrets are files: under systemd, `$CREDENTIALS_DIRECTORY/claude-oauth-token`, `$CREDENTIALS_DIRECTORY/github-app.pem` and, optionally, `$CREDENTIALS_DIRECTORY/teams-webhook-url`; otherwise the same names in `~/.config/dsf/`.
+  Unknown keys are errors, so a secret pasted into the wrong place is rejected rather than silently kept. Secrets are files: under systemd, `$CREDENTIALS_DIRECTORY/claude-oauth-token`, `$CREDENTIALS_DIRECTORY/github-app.pem` and, optionally, `$CREDENTIALS_DIRECTORY/digest-webhook-url`; otherwise the same names in `~/.config/dsf/`.
 
 - **Setting up the GitHub App.** Once per operator:
   1. Create a GitHub App (Settings → Developer settings → GitHub Apps) with webhooks off, installable only on your account, and repository permissions Contents, Issues and Pull requests set to read and write. Nothing else; in particular, not Workflows.
   2. Install it with *Only select repositories*, choosing exactly the configured repos.
   3. Generate a private key, save it as `github-app.pem` with mode 600, and put the App ID in the config's `github.app_id`.
   4. Run `dsf labels init owner/repo` for each repo, which also checks the app is installed there.
+
+- **Setting up the digest (optional).** Without a webhook the digest is printed, which under systemd means the journal (`journalctl -u dsf-digest`). To have it posted instead, create an incoming webhook in either:
+  - **Slack:** at [api.slack.com/apps](https://api.slack.com/apps), choose *Create New App* → *From scratch*. Turn on *Incoming Webhooks*, then *Add New Webhook to Workspace* and pick a channel. The URL starts `https://hooks.slack.com/services/`.
+  - **Microsoft Teams:** in the channel, *Workflows* → *Post to a channel when a webhook request is received*.
+
+  Save the URL as a credential file named `digest-webhook-url`, mode 600, beside the others. dsf tells Slack and Teams apart by the URL, so there is nothing to configure, and `dsf doctor` says which one the digest will go to. `dsf digest --dry-run` shows what would be sent.
 
 ## 8. Repo layout and stack
 
