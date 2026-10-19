@@ -100,6 +100,9 @@ impl Scheduler {
             }
         }
         let queue = round_robin(queues);
+        // Saved now as well as at the end, so `dsf status` shows this tick's
+        // queue while the tick works through it, which can take hours.
+        self.save(&queue, &notes)?;
 
         // Only runs on configured repos: `dsf run --local` may share the
         // state directory on a development machine.
@@ -141,9 +144,14 @@ impl Scheduler {
             }
         }
 
+        self.save(&queue, &notes)
+    }
+
+    /// Records what this tick has seen and done so far, for `dsf status`.
+    fn save(&self, queue: &[QueuedIssue], notes: &[String]) -> Result<TickRecord> {
         let record = TickRecord {
             at: self.factory.now(),
-            queue,
+            queue: queue.to_vec(),
             notes: notes
                 .iter()
                 .map(|note| self.factory.engine().mask(note))

@@ -553,6 +553,18 @@ async fn a_run_interrupted_mid_stage_carries_on_at_the_next_tick() {
     let stopped = tokio::time::timeout(Duration::from_secs(25), first.tick()).await;
     assert!(stopped.is_err(), "the tick should still be running");
     drop(first);
+    // The queue was saved before the work began, so `dsf status` could
+    // show it while the tick ran.
+    let saved: TickRecord =
+        serde_json::from_str(&world.store().kv_get(LAST_TICK).unwrap().unwrap()).unwrap();
+    assert_eq!(
+        saved
+            .queue
+            .iter()
+            .map(|issue| issue.number)
+            .collect::<Vec<_>>(),
+        [1]
+    );
     let attempts = world.store().attempts(1).unwrap();
     let last = attempts.last().unwrap();
     assert_eq!(
