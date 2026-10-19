@@ -1,0 +1,11 @@
+# Provider binaries and local state never belong in the repository.
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
