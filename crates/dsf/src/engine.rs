@@ -583,6 +583,15 @@ impl Engine {
             Ok(workflow) => workflow,
             Err(problem) => return Ok(Setup::Blocked(problem)),
         };
+        let ungated = workflow.ungated_writes();
+        if issue.require_approval && !ungated.is_empty() {
+            let stages: Vec<&str> = ungated.iter().map(StageId::as_str).collect();
+            return Ok(Setup::Blocked(format!(
+                "this run needs plan approval, but the repo's workflow reaches {} \
+                 without passing a gate stage",
+                stages.join(", ")
+            )));
+        }
         for stage in workflow.stages().values() {
             if let StageKind::Command { run, .. } = &stage.kind {
                 let script = snapshot.join(run);
@@ -1300,11 +1309,20 @@ impl Engine {
             image: self.config.worker_image.clone(),
             cmd: vec![format!("/work/{script}")],
             env,
-            binds: vec![Bind {
-                source: tree.clone(),
-                target: "/work".to_owned(),
-                read_only: false,
-            }],
+            // The code under test may write its tree, but not the gate: a
+            // test that rewrote verify.sh as it ran could fake a pass.
+            binds: vec![
+                Bind {
+                    source: tree.clone(),
+                    target: "/work".to_owned(),
+                    read_only: false,
+                },
+                Bind {
+                    source: run.dir.factory_snapshot().join(".factory"),
+                    target: "/work/.factory".to_owned(),
+                    read_only: true,
+                },
+            ],
             network,
             labels: self.labels(run.id, attempt),
             user: self.user.clone(),
@@ -1362,7 +1380,7 @@ impl Engine {
             return self.block(run.id, "the run made no changes to publish");
         }
         let diff = run.repo.diff(&run.base, &run.checkpoint).await?;
-        let findings = self.masker.find(&diff);
+        let findings = self.masker.find_added(&diff);
         if !findings.is_empty() {
             let lines: Vec<String> = findings.iter().map(|f| f.line.to_string()).collect();
             return self.block(
@@ -1370,17 +1388,22 @@ impl Engine {
                 &format!("the change contains what looks like a secret (diff lines {}), so it was not pushed", lines.join(", ")),
             );
         }
+        // The branch gets one commit with the checkpoint's tree, so what was
+        // scanned is all that leaves the host.
+        let message = self.masker.mask(&format!(
+            "{} (#{})\n\nFrom dsf run {}.",
+            run.issue.title, run.issue.number, run.id
+        ));
+        let commit = run
+            .repo
+            .squash(&run.base, &run.checkpoint, &message)
+            .await?;
         let branch = format!("factory/issue-{}", run.issue.number);
         let pushed = async {
             let auth = self.forge.push_auth(&run.issue).await?;
             self.remember(auth.as_ref());
             run.repo
-                .push(
-                    &run.issue.publish_url,
-                    &run.checkpoint,
-                    &branch,
-                    auth.as_ref(),
-                )
+                .push(&run.issue.publish_url, &commit, &branch, auth.as_ref())
                 .await?;
             anyhow::Ok(())
         }
@@ -1404,7 +1427,7 @@ impl Engine {
                 );
             }
         };
-        let mut reason = format!("pushed {branch} at {}", run.checkpoint);
+        let mut reason = format!("pushed {branch} at {commit}");
         if let Some(pull_request) = &pull_request {
             self.db()?.set_pr(run.id, pull_request.number, self.now())?;
             let _ = write!(reason, " and opened {}", pull_request.url);
@@ -1415,7 +1438,7 @@ impl Engine {
         Ok(RunEnd::Published {
             run_id: run.id,
             branch,
-            sha: run.checkpoint.to_string(),
+            sha: commit.to_string(),
             pull_request,
         })
     }
