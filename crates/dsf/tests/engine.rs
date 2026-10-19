@@ -332,6 +332,70 @@ async fn hostile_worktrees_are_refused() {
     }
 }
 
+/// Only the final change is published, as one commit: a secret one stage
+/// wrote and a later stage removed is in no commit that leaves the host.
+#[tokio::test]
+async fn the_branch_is_one_commit_without_the_runs_history() {
+    if !enabled() {
+        return;
+    }
+    let world = World::new("squash");
+    let end = world
+        .engine("fake")
+        .start(&world.issue("fake-implement: leak-token-only\nfake-fix: unleak-fix-calc"))
+        .await
+        .unwrap();
+    let RunEnd::Published { run_id, sha, .. } = end else {
+        panic!("{end:?}")
+    };
+    assert_eq!(
+        world.stages(run_id),
+        [
+            "plan",
+            "approve",
+            "implement",
+            "verify",
+            "fix",
+            "verify",
+            "review"
+        ]
+    );
+    let base = git(&world.origin, &["rev-parse", "HEAD"]);
+    let pushed = git(
+        &world.remote,
+        &["rev-list", &format!("{}..factory/issue-1", base.trim())],
+    );
+    assert_eq!(pushed.trim(), sha);
+    let history = git(&world.remote, &["log", "--all", "--patch"]);
+    assert!(!history.contains("ghp_"), "the token reached the remote");
+    assert_eq!(world.published("settings.py"), None);
+}
+
+/// The code under test can't rewrite the gate it runs under.
+#[tokio::test]
+async fn verify_cannot_change_its_own_gate() {
+    if !enabled() {
+        return;
+    }
+    let world = World::new("rogate");
+    std::fs::write(
+        world.origin.join(".factory/verify.sh"),
+        "#!/bin/sh\nif echo 'exit 0' >> .factory/verify.sh; then echo 'the gate is writable'; \
+         exit 1; fi\ngrep -q 'return a + b' calc.py\n",
+    )
+    .unwrap();
+    git(
+        &world.origin,
+        &["commit", "--quiet", "-am", "gate tries itself"],
+    );
+    let end = world
+        .engine("fake")
+        .start(&world.issue("fake-implement: fix-calc"))
+        .await
+        .unwrap();
+    assert!(matches!(end, RunEnd::Published { .. }), "{end:?}");
+}
+
 #[tokio::test]
 async fn agents_get_only_their_allowlisted_environment_and_cannot_commit() {
     if !enabled() {
@@ -419,15 +483,7 @@ async fn a_usage_limit_suspends_the_run_and_resume_carries_on() {
     );
 }
 
-#[tokio::test]
-async fn a_repo_can_bring_its_own_workflow() {
-    if !enabled() {
-        return;
-    }
-    let world = World::new("workflow");
-    std::fs::write(
-        world.origin.join(".factory/workflow.toml"),
-        r#"
+const WORKFLOW_WITHOUT_A_GATE: &str = r#"
 version = 1
 start = "implement"
 [stages.implement]
@@ -440,7 +496,17 @@ kind = "command"
 run = ".factory/verify.sh"
 max_visits = 50
 on = { success = "@publish", failure = "@blocked" }
-"#,
+"#;
+
+#[tokio::test]
+async fn a_repo_can_bring_its_own_workflow() {
+    if !enabled() {
+        return;
+    }
+    let world = World::new("workflow");
+    std::fs::write(
+        world.origin.join(".factory/workflow.toml"),
+        WORKFLOW_WITHOUT_A_GATE,
     )
     .unwrap();
     git(&world.origin, &["add", "--all"]);
@@ -454,6 +520,28 @@ on = { success = "@publish", failure = "@blocked" }
         panic!("{end:?}")
     };
     assert_eq!(world.stages(run_id), ["implement", "verify"]);
+
+    // The same workflow can't run an issue that needs plan approval: it
+    // would change code before anyone saw a plan.
+    let world = World::new("nogate");
+    std::fs::write(
+        world.origin.join(".factory/workflow.toml"),
+        WORKFLOW_WITHOUT_A_GATE,
+    )
+    .unwrap();
+    git(&world.origin, &["add", "--all"]);
+    git(&world.origin, &["commit", "--quiet", "-m", "own workflow"]);
+    let issue = Issue {
+        require_approval: true,
+        ..world.issue("fake-implement: fix-calc")
+    };
+    let end = world.engine("fake").start(&issue).await.unwrap();
+    let reason = blocked_reason(end);
+    assert!(
+        reason.contains("needs plan approval") && reason.contains("implement"),
+        "{reason}"
+    );
+    assert_eq!(world.published("calc.py"), None);
 }
 
 /// The repository's instructions and the operator's packs reach the

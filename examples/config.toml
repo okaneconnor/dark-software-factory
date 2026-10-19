@@ -35,7 +35,8 @@ app_id = 123456
 
 [[repos]]
 name = "your-github-login/example-repo"
-# never | label (only issues labelled factory:approve-plan) | always
+# never | label (only issues labelled factory:approve-plan) | always.
+# An issue that needs approval can't use a repo workflow without a gate stage.
 approval = "label"
 # Standards packs for this repo's agents, by directory name under
 # [packs] dir. See examples/packs/.
