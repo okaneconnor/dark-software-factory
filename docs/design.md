@@ -250,6 +250,7 @@ The controls below are what make dsf safe to leave running unattended. [`CLAUDE.
   3. Generate a private key, save it as `github-app.pem` with mode 600, and put the App ID in the config's `github.app_id`.
   4. Run `dsf labels init owner/repo` for each repo, which also checks the app is installed there.
 
+- **Preparing a target repo.** Each configured repo needs a `.factory/verify.sh` that exits 0 when the work is done, a `CLAUDE.md` with its conventions, branch protection on the default branch, and the GitHub App installed; `dsf doctor` checks the first and last. Verify runs with no network unless the repo's `.factory/workflow.toml` gives it the proxy. [`examples/target-repos/`](../examples/target-repos/) has kits to copy; the Terraform one runs `fmt`, `validate` and mock-provider `terraform test`, never a plan or apply, and needs `registry.terraform.io` and `releases.hashicorp.com` in `[egress] allow`.
 - **Setting up the digest (optional).** Without a webhook the digest is printed, which under systemd means the journal (`journalctl -u dsf-digest`). To have it posted instead, create an incoming webhook in either:
   - **Slack:** at [api.slack.com/apps](https://api.slack.com/apps), choose *Create New App* → *From scratch*. Turn on *Incoming Webhooks*, then *Add New Webhook to Workspace* and pick a channel. The URL starts `https://hooks.slack.com/services/`.
   - **Microsoft Teams:** in the channel, *Workflows* → *Post to a channel when a webhook request is received*.
@@ -265,11 +266,11 @@ crates/dsf/           the binary: cli, scheduler, status, factory (GitHub side),
 defaults/             default workflow and prompt templates (embedded)
 crates/dsf/tests/fake-agent/  test-only: a shell `claude` that acts on `fake-<stage>:` lines in the
                       issue and prints stream-json, in a small Alpine image
-worker/Dockerfile     agent and verify image: Node, pinned Claude Code, git, make, Python
+worker/Dockerfile     agent and verify image: Node, pinned Claude Code, git, make, Python, pinned Terraform
 docker/dsf.Dockerfile dsf built from source, for the proxy sidecar in development and tests
 docker/release.Dockerfile  the released dsf image: the release binary on Debian slim
 .github/workflows/    ci.yml (the gate and cargo-deny), release.yml (tags → releases)
-examples/             config, systemd units and target-repo .factory/ examples
+examples/             config, systemd units, and kits for target repos (examples/target-repos/)
 docs/                 this document and operations notes
 .factory/verify.sh    the gate; also what CI runs
 ```

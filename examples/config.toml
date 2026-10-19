@@ -46,7 +46,8 @@ max_stages = 16
 
 [egress]
 # Hosts agent containers may reach through the proxy, in addition to the
-# Anthropic API. Typically your package registries.
+# Anthropic API. Typically your package registries; Terraform repos need
+# "registry.terraform.io" and "releases.hashicorp.com".
 allow = ["registry.npmjs.org", "pypi.org", "files.pythonhosted.org", "index.crates.io", "static.crates.io"]
 
 [images]
