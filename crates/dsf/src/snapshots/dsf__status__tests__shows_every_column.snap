@@ -25,5 +25,8 @@ Blocked, last 7 days (2)
   octo/calc#4  Faster multiply  (run 4, Claude authentication failed (authentication_failed); fix the token, then resume)
   octo/calc#6  Make it fast  (run 6, Mon 19 Oct 01:10: the plan needs a decision)
 
+Last tick's problems
+  the worker image w isn't on this host
+
 Last tick's notes
   octo/calc#8: it's blocked by open issue #7

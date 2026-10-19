@@ -67,10 +67,14 @@ impl World {
     }
 
     fn engine(&self, model: &str) -> Engine {
+        self.engine_with_image(model, FAKE_IMAGE)
+    }
+
+    fn engine_with_image(&self, model: &str, image: &str) -> Engine {
         let config = Config {
             instance: self.instance.clone(),
             state_dir: self.state.clone(),
-            worker_image: FAKE_IMAGE.to_owned(),
+            worker_image: image.to_owned(),
             model: model.to_owned(),
             max_turns: 10,
             agent_timeout: Duration::from_secs(120),
@@ -184,6 +188,106 @@ async fn a_fixed_bug_is_verified_reviewed_and_published() {
             .prompt(run_id, "implement")
             .contains("Make add() add."),
         "the plan reaches implement"
+    );
+    // The branch holds the work, so the clone is gone; the logs stay.
+    let dir = world.state.join(format!("runs/{run_id}"));
+    assert!(!dir.join("work").exists() && !dir.join("repo.git").exists());
+    assert!(dir.join("attempts").is_dir());
+}
+
+/// When the host fails under a stage, the run is suspended to try again,
+/// not blocked: the issue did nothing wrong.
+#[tokio::test]
+async fn a_fault_under_a_stage_suspends_the_run_to_retry() {
+    if !enabled() {
+        return;
+    }
+    let world = World::new("fault");
+    let issue = world.issue("fake-implement: fix-calc");
+    let end = world
+        .engine_with_image("fake", "dsf-test-no-such-image:missing")
+        .start(&issue)
+        .await
+        .unwrap();
+    let RunEnd::Faulted {
+        run_id,
+        detail,
+        retry_after,
+    } = end
+    else {
+        panic!("{end:?}")
+    };
+    assert!(detail.starts_with("plan could not run"), "{detail}");
+    assert!(retry_after > jiff::Timestamp::now());
+
+    let end = world
+        .engine("fake")
+        .resume(run_id, ResumeOptions::default())
+        .await
+        .unwrap();
+    assert!(matches!(end, RunEnd::Published { .. }), "{end:?}");
+    assert_eq!(
+        world.stages(run_id),
+        ["plan", "plan", "approve", "implement", "verify", "review"]
+    );
+}
+
+/// A run whose setup failed starts again from a fresh clone.
+#[tokio::test]
+async fn a_fault_during_setup_sets_the_run_up_again() {
+    if !enabled() {
+        return;
+    }
+    let world = World::new("setupfault");
+    let readable = std::fs::metadata(&world.origin).unwrap().permissions();
+    std::fs::set_permissions(&world.origin, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let end = world
+        .engine("fake")
+        .start(&world.issue("fake-implement: fix-calc"))
+        .await;
+    std::fs::set_permissions(&world.origin, readable).unwrap();
+    let RunEnd::Faulted { run_id, detail, .. } = end.unwrap() else {
+        panic!("expected a fault")
+    };
+    assert!(detail.starts_with("setting up the run failed"), "{detail}");
+
+    let end = world
+        .engine("fake")
+        .resume(run_id, ResumeOptions::default())
+        .await
+        .unwrap();
+    assert!(matches!(end, RunEnd::Published { .. }), "{end:?}");
+}
+
+/// A run whose files are gone can't continue, so it is blocked rather than
+/// retried every tick.
+#[tokio::test]
+async fn a_run_that_cant_be_picked_up_again_is_blocked() {
+    if !enabled() {
+        return;
+    }
+    let world = World::new("lost");
+    let end = world
+        .engine("limited")
+        .start(&world.issue("fake-implement: limited"))
+        .await
+        .unwrap();
+    let RunEnd::Suspended { run_id, .. } = end else {
+        panic!("{end:?}")
+    };
+    // Moved rather than deleted: Docker Desktop can hold the worktree's
+    // mount point for a moment after a container goes.
+    let dir = world.state.join(format!("runs/{run_id}"));
+    std::fs::rename(&dir, dir.with_extension("gone")).unwrap();
+    let end = world
+        .engine("fake")
+        .resume(run_id, ResumeOptions::default())
+        .await
+        .unwrap();
+    let reason = blocked_reason(end);
+    assert!(
+        reason.contains("couldn't pick the run up again"),
+        "{reason}"
     );
 }
 

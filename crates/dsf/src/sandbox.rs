@@ -17,8 +17,8 @@ use anyhow::{Context, Result, bail};
 use bollard::Docker;
 use bollard::errors::Error as DockerError;
 use bollard::models::{
-    ContainerCreateBody, HostConfig, Mount, MountType, NetworkConnectRequest, NetworkCreateRequest,
-    RestartPolicy, RestartPolicyNameEnum,
+    ContainerCreateBody, HostConfig, HostConfigLogConfig, Mount, MountType, NetworkConnectRequest,
+    NetworkCreateRequest, RestartPolicy, RestartPolicyNameEnum,
 };
 use bollard::query_parameters::{
     CreateContainerOptionsBuilder, KillContainerOptionsBuilder, ListContainersOptionsBuilder,
@@ -38,6 +38,10 @@ const PROXY_CONFIG_LABEL: &str = "dsf.proxy-config";
 pub const PROXY_PORT: u16 = 3128;
 /// HOME inside every container: a tmpfs, so nothing persists between runs.
 pub const HOME: &str = "/home/agent";
+/// What dsf keeps of each of a container's output streams. A test stuck
+/// printing in a loop would otherwise fill the disk, both in dsf's log
+/// files and in Docker's own copy.
+const MAX_LOG_BYTES: u64 = 64 * 1024 * 1024;
 
 const KILL_GRACE: Duration = Duration::from_secs(10);
 
@@ -446,6 +450,16 @@ fn container_body(spec: &Spec) -> ContainerCreateBody {
             ipc_mode: Some("private".to_owned()),
             init: Some(true),
             auto_remove: Some(false),
+            log_config: Some(HostConfigLogConfig {
+                typ: Some("json-file".to_owned()),
+                config: Some(HashMap::from([
+                    (
+                        "max-size".to_owned(),
+                        format!("{}m", MAX_LOG_BYTES / 1024 / 1024),
+                    ),
+                    ("max-file".to_owned(), "2".to_owned()),
+                ])),
+            }),
             ..HostConfig::default()
         }),
         ..ContainerCreateBody::default()
@@ -453,8 +467,8 @@ fn container_body(spec: &Spec) -> ContainerCreateBody {
 }
 
 async fn copy_logs(docker: Docker, id: String, stdout: PathBuf, stderr: PathBuf) -> Result<()> {
-    let mut out = tokio::fs::File::create(&stdout).await?;
-    let mut err = tokio::fs::File::create(&stderr).await?;
+    let mut out = CappedLog::create(&stdout, MAX_LOG_BYTES).await?;
+    let mut err = CappedLog::create(&stderr, MAX_LOG_BYTES).await?;
     let options = LogsOptionsBuilder::new()
         .follow(true)
         .stdout(true)
@@ -474,6 +488,46 @@ async fn copy_logs(docker: Docker, id: String, stdout: PathBuf, stderr: PathBuf)
     out.flush().await?;
     err.flush().await?;
     Ok(())
+}
+
+/// A log file that stops growing at a limit, saying so at the cut. The
+/// stream is still read to the end, so the container never blocks on it.
+struct CappedLog {
+    file: tokio::fs::File,
+    room: u64,
+    cut: bool,
+}
+
+impl CappedLog {
+    async fn create(path: &Path, limit: u64) -> Result<Self> {
+        Ok(Self {
+            file: tokio::fs::File::create(path)
+                .await
+                .with_context(|| format!("creating {}", path.display()))?,
+            room: limit,
+            cut: false,
+        })
+    }
+
+    async fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        if self.cut {
+            return Ok(());
+        }
+        let keep = usize::try_from(self.room).map_or(bytes.len(), |room| room.min(bytes.len()));
+        self.file.write_all(&bytes[..keep]).await?;
+        self.room -= keep as u64;
+        if keep < bytes.len() {
+            self.cut = true;
+            self.file
+                .write_all(b"\n[dsf: output cut here; it went over the size limit]\n")
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush().await
+    }
 }
 
 #[cfg(test)]
@@ -507,6 +561,23 @@ mod tests {
             limits: Limits::default(),
             timeout: Duration::from_secs(60),
         }
+    }
+
+    #[tokio::test]
+    async fn logs_stop_growing_at_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.log");
+        let mut log = CappedLog::create(&path, 10).await.unwrap();
+        log.write_all(b"12345").await.unwrap();
+        log.write_all(b"67890abc").await.unwrap();
+        log.write_all(b"more").await.unwrap();
+        log.flush().await.unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.starts_with("1234567890\n[dsf: output cut here"),
+            "{text}"
+        );
+        assert!(!text.contains("abc") && !text.contains("more"), "{text}");
     }
 
     #[test]

@@ -13,7 +13,8 @@ mod support;
 use std::sync::Arc;
 use std::time::Duration;
 
-use dsf::scheduler::{BACKOFF_UNTIL, LAST_TICK, PAUSED, Scheduler, TickRecord};
+use dsf::rundir::RunDir;
+use dsf::scheduler::{BACKOFF_REASON, BACKOFF_UNTIL, LAST_TICK, PAUSED, Scheduler, TickRecord};
 use dsf::store::{Advance, AttemptEnd, NewRun, RunStatus, Store, SuspendReason};
 use dsf_core::routing::Progress;
 use jiff::tz::TimeZone;
@@ -35,11 +36,18 @@ fn london() -> TimeZone {
     TimeZone::posix("GMT0BST,M3.5.0/1,M10.5.0").unwrap()
 }
 
+/// With Docker, the host checks run for real; without it, tests never
+/// start a container, so the host is taken as fit.
 fn scheduler(world: &World, fake: &Fake, extra: &str, model: &str, now: Timestamp) -> Scheduler {
     let factory = world
         .factory_with(fake, world.config_with("label", extra), model)
         .with_clock(Arc::new(move || now));
-    Scheduler::new(factory, london())
+    let scheduler = Scheduler::new(factory, london());
+    if enabled() {
+        scheduler
+    } else {
+        scheduler.without_host_checks()
+    }
 }
 
 /// A trusted issue: alice wrote it and labelled it ready.
@@ -371,6 +379,156 @@ async fn a_plan_no_one_approves_expires_even_outside_the_window() {
             "POST /repos/octo/calc/issues/1/labels",
             "POST /repos/octo/calc/issues/1/comments",
         ]
+    );
+}
+
+#[tokio::test]
+async fn finished_runs_files_go_once_they_are_older_than_the_retention() {
+    let world = World::new("prune");
+    let fake = Fake::start().await;
+    fake.listing("factory:ready", json!([])).await;
+    fake.listing("factory:running", json!([])).await;
+    let mut store = world.store();
+    let old = seed_run(&mut store, 1);
+    store
+        .end_run(
+            old,
+            RunStatus::Published,
+            "published",
+            at("2026-10-01T00:00:00Z"),
+        )
+        .unwrap();
+    let recent = seed_run(&mut store, 2);
+    store
+        .end_run(
+            recent,
+            RunStatus::Blocked,
+            "blocked",
+            at("2026-10-19T00:00:00Z"),
+        )
+        .unwrap();
+    let suspended = seed_run(&mut store, 3);
+    store
+        .suspend_setup(
+            suspended,
+            at("2026-10-01T01:00:00Z"),
+            at("2026-10-01T00:00:00Z"),
+        )
+        .unwrap();
+    for run in [old, recent, suspended] {
+        RunDir::create(&world.state, run).unwrap();
+    }
+
+    let record = scheduler(&world, &fake, "", "fake", at(NIGHT))
+        .tick()
+        .await
+        .unwrap();
+    assert!(
+        record
+            .notes
+            .contains(&"removed the files of 1 run(s) finished over 14d ago".to_owned()),
+        "{:?}",
+        record.notes
+    );
+    assert_eq!(RunDir::list(&world.state).unwrap(), [recent, suspended]);
+}
+
+/// When the host can't run work, nothing is claimed or resumed, and why is
+/// the tick's problem.
+#[tokio::test]
+async fn a_host_that_cant_run_work_starts_nothing() {
+    if !enabled() {
+        return;
+    }
+    let world = World::new("unfit");
+    let fake = Fake::start().await;
+    let issue = ready_issue(&fake, 1, FIX).await;
+    fake.listing("factory:ready", json!([issue])).await;
+    fake.listing("factory:running", json!([])).await;
+    fake.writable().await;
+
+    let extra = format!("{ALWAYS_OPEN}\nmin_free_disk_gb = 10000");
+    let record = scheduler(&world, &fake, &extra, "fake", at(NIGHT))
+        .tick()
+        .await
+        .unwrap();
+    assert_eq!(record.problems.len(), 1, "{:?}", record.problems);
+    assert!(
+        record.problems[0].contains("below the 10000 GB minimum"),
+        "{:?}",
+        record.problems
+    );
+    assert!(
+        record.notes.contains(
+            &"not starting anything: this host can't run work (see the problems)".to_owned()
+        ),
+        "{:?}",
+        record.notes
+    );
+    assert_eq!(fake.writes().await, Vec::<String>::new());
+    let store = world.store();
+    assert_eq!(store.unfinished_runs().unwrap(), Vec::new());
+    assert_eq!(store.problems_since(at(NIGHT)).unwrap().len(), 1);
+}
+
+/// A fault in one run backs claiming off, rather than moving on to fail
+/// the next issue the same way, and leaves the run to carry on later
+/// without blaming its issue.
+#[tokio::test]
+async fn a_fault_backs_claiming_off_instead_of_burning_the_queue() {
+    if !enabled() {
+        return;
+    }
+    let world = World::new("fault");
+    let fake = Fake::start().await;
+    let first = ready_issue(&fake, 1, FIX).await;
+    let second = ready_issue(&fake, 2, FIX).await;
+    fake.listing("factory:ready", json!([second, first])).await;
+    fake.listing("factory:running", json!([])).await;
+    fake.writable().await;
+
+    // The image goes missing after the host was checked: the first stage
+    // can't start its container.
+    let now = Timestamp::now();
+    let factory = world
+        .factory_with_image(
+            &fake,
+            world.config_with("label", ALWAYS_OPEN),
+            "fake",
+            "dsf-test-no-such-image:missing",
+        )
+        .with_clock(Arc::new(move || now));
+    let record = Scheduler::new(factory, london())
+        .without_host_checks()
+        .tick()
+        .await
+        .unwrap();
+    assert!(
+        record.problems[0].starts_with("octo/calc#1: run 1 hit a fault"),
+        "{:?}",
+        record.problems
+    );
+    assert!(
+        record
+            .notes
+            .iter()
+            .any(|note| note.starts_with("stopped claiming: backing off after a fault until")),
+        "{:?}",
+        record.notes
+    );
+    let store = world.store();
+    assert_eq!(
+        store.kv_get(BACKOFF_REASON).unwrap().as_deref(),
+        Some("a fault")
+    );
+    assert_eq!(store.run(1).unwrap().status, RunStatus::Suspended);
+    assert!(store.active_run("octo/calc", 2).unwrap().is_none());
+    let writes = fake.writes().await;
+    assert!(
+        !writes
+            .iter()
+            .any(|write| write.contains("/issues/1/comments") || write.contains("/issues/2/")),
+        "{writes:?}"
     );
 }
 

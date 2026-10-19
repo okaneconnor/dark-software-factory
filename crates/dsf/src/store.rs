@@ -452,6 +452,23 @@ impl Store {
         Ok(())
     }
 
+    /// Suspends a run that hasn't reached its first stage, because setting
+    /// it up failed. It resumes by being set up afresh.
+    pub fn suspend_setup(
+        &mut self,
+        run_id: i64,
+        resume_after: Timestamp,
+        now: Timestamp,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE runs SET status = 'suspended', suspend_reason = 'interrupted',
+                             resume_after = ?2, next_stage = NULL, updated_at = ?3
+             WHERE id = ?1",
+            params![run_id, resume_after.to_string(), now.to_string()],
+        )?;
+        Ok(())
+    }
+
     /// Suspends a run between stages, before `next_stage` starts. No
     /// attempt is opened, and the visit `progress` counts for the stage
     /// stands: the run resumes with that stage.
@@ -701,6 +718,33 @@ impl Store {
         Ok(())
     }
 
+    /// Records a problem with the factory itself rather than one run, for
+    /// the digest. `message` must already be masked.
+    pub fn problem(&mut self, message: &str, now: Timestamp) -> Result<()> {
+        self.event(None, PROBLEM, message, now)
+    }
+
+    /// Problems recorded at or after `since`, oldest first.
+    pub fn problems_since(&self, since: Timestamp) -> Result<Vec<(Timestamp, String)>> {
+        let mut query = self.conn.prepare(
+            "SELECT at, message FROM events WHERE run_id IS NULL AND kind = ?1
+             ORDER BY id DESC LIMIT 1000",
+        )?;
+        let rows = query
+            .query_map([PROBLEM], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        // Compared as times, not text: stored times vary in precision.
+        let mut problems: Vec<(Timestamp, String)> = rows
+            .into_iter()
+            .filter_map(|(at, message)| Some((at.parse().ok()?, message)))
+            .filter(|(at, _)| *at >= since)
+            .collect();
+        problems.reverse();
+        Ok(problems)
+    }
+
     pub fn events(&self, run_id: i64) -> Result<Vec<(String, String)>> {
         let mut query = self
             .conn
@@ -734,6 +778,9 @@ impl Store {
         Ok(())
     }
 }
+
+/// The event kind for a problem with the factory rather than one run.
+const PROBLEM: &str = "problem";
 
 const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const BUSY_RETRIES: u32 = 20;
@@ -872,6 +919,37 @@ mod tests {
             comments: "[]",
             require_approval: false,
         }
+    }
+
+    #[test]
+    fn problems_are_kept_apart_from_runs_and_read_by_time() {
+        let mut store = Store::open_in_memory().unwrap();
+        let run_id = store.create_run(&issue(1), now()).unwrap().unwrap();
+        store
+            .event(Some(run_id), PROBLEM, "a run's", now())
+            .unwrap();
+        let earlier: Timestamp = "2026-10-18T22:59:59.5Z".parse().unwrap();
+        let later: Timestamp = "2026-10-18T23:00:00.25Z".parse().unwrap();
+        store.problem("too early", earlier).unwrap();
+        store.problem("on time", now()).unwrap();
+        store.problem("later", later).unwrap();
+        assert_eq!(
+            store.problems_since(now()).unwrap(),
+            [(now(), "on time".to_owned()), (later, "later".to_owned())]
+        );
+    }
+
+    #[test]
+    fn a_run_whose_setup_failed_is_suspended_with_no_stage() {
+        let mut store = Store::open_in_memory().unwrap();
+        let run_id = store.create_run(&issue(1), now()).unwrap().unwrap();
+        let retry: Timestamp = "2026-10-18T23:30:00Z".parse().unwrap();
+        store.suspend_setup(run_id, retry, now()).unwrap();
+        let run = store.run(run_id).unwrap();
+        assert_eq!(run.status, RunStatus::Suspended);
+        assert_eq!(run.suspend_reason, Some(SuspendReason::Interrupted));
+        assert_eq!(run.resume_after, Some(retry));
+        assert_eq!(run.next_stage, None);
     }
 
     #[test]

@@ -22,7 +22,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use dsf_core::clamp::Caps;
 use dsf_core::protect::{self, ProtectedPaths};
 use dsf_core::routing::{End, Next, Progress};
-use dsf_core::schedule::usage_limit_resume;
+use dsf_core::schedule::{self, usage_limit_resume};
 use dsf_core::signature::FailureSignature;
 use dsf_core::workflow::{
     self, AgentMode, Network as StageNetwork, Schema, StageId, StageKind, Terminal, Workflow,
@@ -51,6 +51,10 @@ const PUBLISH: &str = "@publish";
 /// Usage-limit hits in a row with no completed agent stage between them,
 /// which lengthen the backoff when the reset time isn't known.
 const LIMIT_HITS: &str = "usage_limit_hits";
+
+/// Faults in a row with no stage finishing between them, which lengthen
+/// the wait before dsf tries again.
+const FAULTS: &str = "faults_in_a_row";
 
 /// The time, from the system clock except in tests.
 pub type Clock = Arc<dyn Fn() -> Timestamp + Send + Sync>;
@@ -173,6 +177,26 @@ pub enum RunEnd {
         run_id: i64,
         reason: String,
     },
+    /// dsf itself failed rather than the work: Docker, the disk or git on
+    /// the host. The run is suspended to try again after `retry_after`,
+    /// without blaming the issue, and claiming should wait as long.
+    Faulted {
+        run_id: i64,
+        detail: String,
+        retry_after: Timestamp,
+    },
+}
+
+impl RunEnd {
+    pub fn run_id(&self) -> i64 {
+        match self {
+            Self::Published { run_id, .. }
+            | Self::Blocked { run_id, .. }
+            | Self::Suspended { run_id, .. }
+            | Self::PublishFailed { run_id, .. }
+            | Self::Faulted { run_id, .. } => *run_id,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -229,6 +253,9 @@ enum StageResult {
         detail: String,
     },
     Block(String),
+    /// The stage couldn't run for a reason outside the work, e.g. Docker
+    /// failing. Retried later.
+    Fault(String),
 }
 
 /// An attempt's results, owned until they are written.
@@ -375,8 +402,33 @@ impl Engine {
                 self.drive(*run, progress, next).await
             }
             Ok(Setup::Blocked(reason)) => self.block(run_id, &reason),
-            Err(error) => self.block(run_id, &format!("setup failed: {error:#}")),
+            Err(error) => {
+                let detail = self
+                    .masker
+                    .mask(&format!("setting up the run failed: {error:#}"));
+                let retry_after = self.fault_backoff()?;
+                self.db()?.suspend_setup(run_id, retry_after, self.now())?;
+                self.event(run_id, "fault", &detail);
+                Ok(RunEnd::Faulted {
+                    run_id,
+                    detail,
+                    retry_after,
+                })
+            }
         }
+    }
+
+    /// When to try again after dsf itself failed, waiting longer each time
+    /// it fails again before a stage gets through.
+    pub fn fault_backoff(&self) -> Result<Timestamp> {
+        let mut db = self.db()?;
+        let faults = db
+            .kv_get(FAULTS)?
+            .and_then(|n| n.parse::<u32>().ok())
+            .unwrap_or(0)
+            .saturating_add(1);
+        db.kv_set(FAULTS, &faults.to_string())?;
+        Ok(schedule::backoff(self.now(), faults))
     }
 
     /// Ends an unfinished run that will never continue, e.g. because its
@@ -421,6 +473,53 @@ impl Engine {
         Ok(interrupted)
     }
 
+    /// What stops this host running work, if anything: Docker unreachable,
+    /// the worker image missing, or less free disk than `min_free_bytes`.
+    /// Checked every tick, so a broken host holds work back rather than
+    /// failing runs one after another.
+    pub async fn preflight(&self, min_free_bytes: u64) -> Vec<String> {
+        let mut problems = Vec::new();
+        let image = &self.config.worker_image;
+        match self.sandbox.has_image(image).await {
+            Ok(true) => {}
+            Ok(false) => problems.push(format!("the worker image {image} isn't on this host")),
+            Err(error) => problems.push(format!("Docker: {error:#}")),
+        }
+        let dir = &self.config.state_dir;
+        match crate::rundir::free_space(dir) {
+            Ok(free) if free < min_free_bytes => problems.push(format!(
+                "only {} free on the disk holding {}, below the {} minimum",
+                crate::rundir::size_text(free),
+                dir.display(),
+                crate::rundir::size_text(min_free_bytes)
+            )),
+            Ok(_) => {}
+            Err(error) => problems.push(format!("{error:#}")),
+        }
+        problems
+    }
+
+    /// Removes the files of runs that finished more than `keep` ago, and
+    /// returns how many went. Their records stay.
+    pub fn prune(&self, keep: Duration) -> Result<usize> {
+        let keep = jiff::SignedDuration::try_from(keep)?;
+        let Ok(cutoff) = self.now().checked_sub(keep) else {
+            return Ok(0);
+        };
+        let mut removed = 0;
+        for run_id in RunDir::list(&self.config.state_dir)? {
+            // A directory the store doesn't know isn't dsf's to remove.
+            let Ok(run) = self.db()?.run(run_id) else {
+                continue;
+            };
+            if run.status.is_finished() && run.updated_at < cutoff {
+                RunDir::discard(&self.config.state_dir, run_id)?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
     /// The issue's unfinished run, if any.
     pub fn active_run(&self, repo: &str, issue: u64) -> Result<Option<store::Run>> {
         self.db()?.active_run(repo, issue)
@@ -457,7 +556,9 @@ impl Engine {
         }
     }
 
-    /// Resumes a suspended or interrupted run from its last checkpoint.
+    /// Resumes a suspended or interrupted run from its last checkpoint. A
+    /// run whose setup failed is set up afresh. One whose saved state can't
+    /// be picked up again is blocked, rather than retried for ever.
     pub async fn resume(&self, run_id: i64, options: ResumeOptions) -> Result<RunEnd> {
         // A crashed attempt's container may still be running. It must be
         // gone before the worktree is reset under it.
@@ -480,22 +581,6 @@ impl Engine {
                 stored.status.as_str()
             );
         }
-        let dir = RunDir::open(&self.config.state_dir, run_id)?;
-        let repo = HostGit::open(self.git.clone(), &dir.git_dir(), &dir.work_tree());
-        let base = Sha::parse(
-            stored
-                .base_sha
-                .as_deref()
-                .context("the run never cloned its repository")?,
-        )?;
-        let checkpoint = Sha::parse(stored.checkpoint_sha.as_deref().unwrap_or(base.as_str()))?;
-        repo.reset_to(&checkpoint).await?;
-        let (workflow, _) = Workflow::parse(&stored.workflow)?.clamp(&self.config.caps)?;
-        let prompts = Prompts::from_snapshot(&dir.factory_snapshot())?;
-        // Runs from before instructions were saved simply have none.
-        let instructions = std::fs::read_to_string(dir.instructions()).unwrap_or_default();
-        let (verify_output, review) = self.handoff(run_id, &dir, &workflow)?;
-        let (protected, protected_list) = self.protected();
         let issue = Issue {
             repo: stored.repo.clone(),
             number: stored.issue,
@@ -508,22 +593,19 @@ impl Engine {
                 .context("reading the run's stored comments")?,
             require_approval: stored.require_approval,
         };
-        let run = Run {
-            id: run_id,
-            issue,
-            dir,
-            repo,
-            base,
-            checkpoint,
-            workflow,
-            prompts,
-            protected,
-            protected_list,
-            plan: stored.plan.clone(),
-            verify_output,
-            review,
-            approve_gate: options.approve,
-            instructions,
+        if stored.next_stage.is_none() && self.db()?.attempts(run_id)?.is_empty() {
+            RunDir::discard(&self.config.state_dir, run_id)?;
+            self.event(run_id, "resumed", "setting the run up again");
+            return self.run_new(run_id, &issue).await;
+        }
+        let run = match self.reopen(&stored, issue, options).await {
+            Ok(run) => run,
+            Err(error) => {
+                return self.block(
+                    run_id,
+                    &format!("dsf couldn't pick the run up again: {error:#}"),
+                );
+            }
         };
         self.event(run_id, "resumed", &format!("from {}", run.checkpoint));
         let mut progress = stored.progress;
@@ -545,6 +627,49 @@ impl Engine {
             None => progress.begin(&run.workflow),
         };
         self.drive(run, progress, next).await
+    }
+
+    /// A stored run, ready to carry on: its worktree reset to the last
+    /// checkpoint, and what its next stage needs read back from disk.
+    async fn reopen(
+        &self,
+        stored: &store::Run,
+        issue: Issue,
+        options: ResumeOptions,
+    ) -> Result<Run> {
+        let dir = RunDir::open(&self.config.state_dir, stored.id)?;
+        let repo = HostGit::open(self.git.clone(), &dir.git_dir(), &dir.work_tree());
+        let base = Sha::parse(
+            stored
+                .base_sha
+                .as_deref()
+                .context("the run never cloned its repository")?,
+        )?;
+        let checkpoint = Sha::parse(stored.checkpoint_sha.as_deref().unwrap_or(base.as_str()))?;
+        repo.reset_to(&checkpoint).await?;
+        let (workflow, _) = Workflow::parse(&stored.workflow)?.clamp(&self.config.caps)?;
+        let prompts = Prompts::from_snapshot(&dir.factory_snapshot())?;
+        // Runs from before instructions were saved simply have none.
+        let instructions = std::fs::read_to_string(dir.instructions()).unwrap_or_default();
+        let (verify_output, review) = self.handoff(stored.id, &dir, &workflow)?;
+        let (protected, protected_list) = self.protected();
+        Ok(Run {
+            id: stored.id,
+            issue,
+            dir,
+            repo,
+            base,
+            checkpoint,
+            workflow,
+            prompts,
+            protected,
+            protected_list,
+            plan: stored.plan.clone(),
+            verify_output,
+            review,
+            approve_gate: options.approve,
+            instructions,
+        })
     }
 
     async fn setup(&self, run_id: i64, issue: &Issue) -> Result<Setup> {
@@ -708,7 +833,7 @@ impl Engine {
             self.event(run.id, "stage", &format!("{stage} (visit {visit})"));
             let result = match self.run_stage(&mut run, &stage, visit, attempt).await {
                 Ok(result) => result,
-                Err(error) => StageResult::Block(format!("{stage} could not run: {error:#}")),
+                Err(error) => StageResult::Fault(format!("{stage} could not run: {error:#}")),
             };
             next = match self.conclude(&run, attempt, &stage, result, &mut progress)? {
                 Step::Next(next) => next,
@@ -781,6 +906,7 @@ impl Engine {
                 signature,
                 end,
             } => {
+                self.db()?.kv_delete(FAULTS)?;
                 let next = progress.complete(&run.workflow, stage, &label, signature);
                 self.event(run.id, "outcome", &format!("{stage}: {label}"));
                 match &next {
@@ -833,20 +959,26 @@ impl Engine {
                     reason,
                     resume_after,
                 };
-                self.finish(
-                    run,
-                    attempt,
-                    None,
-                    &Ended::failed(&detail),
-                    progress,
-                    advance,
-                )?;
-                self.event(run.id, "suspended", &detail);
+                self.stop(run, attempt, progress, advance, ("suspended", &detail))?;
                 Ok(Step::Stop(RunEnd::Suspended {
                     run_id: run.id,
                     reason,
                     resume_after,
                     detail,
+                }))
+            }
+            StageResult::Fault(detail) => {
+                let detail = self.masker.mask(&detail);
+                let retry_after = self.fault_backoff()?;
+                let advance = Advance::Suspend {
+                    reason: SuspendReason::Interrupted,
+                    resume_after: Some(retry_after),
+                };
+                self.stop(run, attempt, progress, advance, ("fault", &detail))?;
+                Ok(Step::Stop(RunEnd::Faulted {
+                    run_id: run.id,
+                    detail,
+                    retry_after,
                 }))
             }
             StageResult::Block(reason) => {
@@ -855,21 +987,28 @@ impl Engine {
                     status: RunStatus::Blocked,
                     reason: &reason,
                 };
-                self.finish(
-                    run,
-                    attempt,
-                    None,
-                    &Ended::failed(&reason),
-                    progress,
-                    advance,
-                )?;
-                self.event(run.id, "blocked", &reason);
+                self.stop(run, attempt, progress, advance, ("blocked", &reason))?;
                 Ok(Step::Stop(RunEnd::Blocked {
                     run_id: run.id,
                     reason,
                 }))
             }
         }
+    }
+
+    /// Ends an attempt that stops the run, and records why as an event of
+    /// the given kind. `why` is masked already.
+    fn stop(
+        &self,
+        run: &Run,
+        attempt: i64,
+        progress: &Progress,
+        advance: Advance<'_>,
+        (kind, why): (&str, &str),
+    ) -> Result<()> {
+        self.finish(run, attempt, None, &Ended::failed(why), progress, advance)?;
+        self.event(run.id, kind, why);
+        Ok(())
     }
 
     fn finish(
@@ -1435,6 +1574,15 @@ impl Engine {
         self.db()?
             .end_run(run.id, RunStatus::Published, &reason, self.now())?;
         self.event(run.id, "published", &reason);
+        // The branch holds the work now. The logs stay until the run is
+        // older than the operator keeps runs for.
+        if let Err(error) = run.dir.remove_checkout() {
+            self.event(
+                run.id,
+                "cleanup",
+                &format!("removing the run's clone failed: {error:#}"),
+            );
+        }
         Ok(RunEnd::Published {
             run_id: run.id,
             branch,

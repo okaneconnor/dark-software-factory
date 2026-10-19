@@ -284,10 +284,20 @@ impl World {
     /// A factory whose fake agent runs as `model`, which some of its
     /// actions read: `limited` hits a usage limit, `fast` skips sleeps.
     pub fn factory_with(&self, fake: &Fake, config: Config, model: &str) -> Factory {
+        self.factory_with_image(fake, config, model, FAKE_IMAGE)
+    }
+
+    pub fn factory_with_image(
+        &self,
+        fake: &Fake,
+        config: Config,
+        model: &str,
+        image: &str,
+    ) -> Factory {
         let engine_config = EngineConfig {
             instance: self.instance.clone(),
             state_dir: self.state.clone(),
-            worker_image: FAKE_IMAGE.to_owned(),
+            worker_image: image.to_owned(),
             model: model.to_owned(),
             max_turns: 10,
             agent_timeout: Duration::from_secs(180),
