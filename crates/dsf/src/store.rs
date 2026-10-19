@@ -8,7 +8,9 @@ use std::str::FromStr;
 use anyhow::{Context, Result, anyhow};
 use dsf_core::routing::Progress;
 use jiff::Timestamp;
-use rusqlite::{Connection, ErrorCode, OptionalExtension, Row, params};
+use rusqlite::{
+    Connection, ErrorCode, OptionalExtension, Row, Transaction, TransactionBehavior, params,
+};
 use rusqlite_migration::{M, Migrations};
 
 const SCHEMA_V1: &str = "
@@ -287,13 +289,28 @@ impl Store {
     }
 
     fn init(mut conn: Connection) -> Result<Self> {
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "foreign_keys", "ON")?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        migrations()
-            .to_latest(&mut conn)
-            .context("migrating the database")?;
+        conn.busy_timeout(BUSY_TIMEOUT)?;
+        // A tick, the digest and `dsf status` can open the database at the
+        // same moment. SQLite reports some of those collisions, such as
+        // another process closing the database, as busy without waiting,
+        // so opening tries again for a while before giving up.
+        retry_busy(is_busy, || {
+            conn.pragma_update(None, "journal_mode", "WAL")?;
+            conn.pragma_update(None, "foreign_keys", "ON")
+        })?;
+        retry_busy(
+            |error| matches!(error, rusqlite_migration::Error::RusqliteError { err, .. } if is_busy(err)),
+            || migrations().to_latest(&mut conn),
+        )
+        .context("migrating the database")?;
         Ok(Self { conn })
+    }
+
+    /// A write transaction that takes the write lock up front, so it waits
+    /// for another writer instead of failing when it tries to upgrade.
+    fn write(&mut self) -> rusqlite::Result<Transaction<'_>> {
+        self.conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
     }
 
     /// Creates a queued run, or returns `None` if the issue already has an
@@ -489,7 +506,7 @@ impl Store {
         now: Timestamp,
     ) -> Result<i64> {
         let now = now.to_string();
-        let tx = self.conn.transaction()?;
+        let tx = self.write()?;
         tx.execute(
             "INSERT INTO stage_attempts (run_id, stage, visit, status, before_sha, started_at)
              VALUES (?1, ?2, ?3, 'running', ?4, ?5)",
@@ -529,7 +546,7 @@ impl Store {
         now: Timestamp,
     ) -> Result<()> {
         let now = now.to_string();
-        let tx = self.conn.transaction()?;
+        let tx = self.write()?;
         tx.execute(
             "UPDATE stage_attempts
              SET status = 'finished', outcome = ?2, failure = ?3, exit_code = ?4, after_sha = ?5,
@@ -613,7 +630,7 @@ impl Store {
         now: Timestamp,
     ) -> Result<Vec<Interrupted>> {
         let now = now.to_string();
-        let tx = self.conn.transaction()?;
+        let tx = self.write()?;
         let interrupted = {
             let mut query = tx.prepare(
                 "SELECT run_id, id, stage, container_id FROM stage_attempts
@@ -715,6 +732,32 @@ impl Store {
     pub fn kv_delete(&mut self, key: &str) -> Result<()> {
         self.conn.execute("DELETE FROM kv WHERE key = ?1", [key])?;
         Ok(())
+    }
+}
+
+const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const BUSY_RETRIES: u32 = 20;
+const BUSY_PAUSE: std::time::Duration = std::time::Duration::from_millis(250);
+
+fn is_busy(error: &rusqlite::Error) -> bool {
+    matches!(error, rusqlite::Error::SqliteFailure(e, _) if e.code == ErrorCode::DatabaseBusy)
+}
+
+/// Runs `step` again while it fails with an error `busy` recognises, for
+/// about five seconds.
+fn retry_busy<T, E>(
+    busy: impl Fn(&E) -> bool,
+    mut step: impl FnMut() -> Result<T, E>,
+) -> Result<T, E> {
+    let mut tries = 1;
+    loop {
+        match step() {
+            Err(error) if busy(&error) && tries < BUSY_RETRIES => {
+                tries += 1;
+                std::thread::sleep(BUSY_PAUSE);
+            }
+            result => return result,
+        }
     }
 }
 
@@ -829,6 +872,59 @@ mod tests {
             comments: "[]",
             require_approval: false,
         }
+    }
+
+    #[test]
+    fn busy_steps_are_retried_then_given_up_on() {
+        let busy = || {
+            rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                None,
+            )
+        };
+        let mut calls = 0;
+        let result = retry_busy(is_busy, || {
+            calls += 1;
+            if calls < 3 { Err(busy()) } else { Ok(calls) }
+        });
+        assert_eq!(result.unwrap(), 3);
+
+        let mut calls = 0;
+        let result: rusqlite::Result<()> = retry_busy(is_busy, || {
+            calls += 1;
+            Err(busy())
+        });
+        assert!(result.is_err());
+        assert_eq!(calls, BUSY_RETRIES);
+
+        // Anything else fails straight away.
+        let mut calls = 0;
+        let result: rusqlite::Result<()> = retry_busy(is_busy, || {
+            calls += 1;
+            Err(rusqlite::Error::InvalidQuery)
+        });
+        assert!(result.is_err());
+        assert_eq!(calls, 1);
+    }
+
+    /// Two processes writing at once: the second waits for the first.
+    #[test]
+    fn writers_queue_rather_than_fail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dsf.sqlite");
+        let mut first = Store::open(&path).unwrap();
+        let mut second = Store::open(&path).unwrap();
+        let run = first.create_run(&issue(1), now()).unwrap().unwrap();
+        let holding = first.write().unwrap();
+        let waiting = std::thread::spawn(move || {
+            second
+                .interrupt_unfinished(None, now())
+                .map(|interrupted| interrupted.len())
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        holding.commit().unwrap();
+        assert_eq!(waiting.join().unwrap().unwrap(), 0);
+        assert_eq!(first.run(run).unwrap().status, RunStatus::Queued);
     }
 
     #[test]

@@ -161,6 +161,15 @@ impl Board {
         let mut columns = Columns::default();
         let queue = self.last_tick.as_ref().map_or(&[][..], |t| &t.queue[..]);
         for issue in queue {
+            // Claimed since the tick listed it: it's under Running now.
+            let working = self.unfinished.iter().any(|(run, _)| {
+                run.repo == issue.repo
+                    && run.issue == issue.number
+                    && matches!(run.status, RunStatus::Queued | RunStatus::Running)
+            });
+            if working {
+                continue;
+            }
             let paused = self.unfinished.iter().find(|(run, _)| {
                 run.repo == issue.repo
                     && run.issue == issue.number
@@ -483,6 +492,48 @@ mod tests {
         let text = board.render(&config(), &TimeZone::UTC);
         assert!(text.contains("weekly 85% (reset since); cap 80%"), "{text}");
         assert!(text.contains("Claiming: allowed\n"), "{text}");
+    }
+
+    #[test]
+    fn an_issue_being_worked_shows_only_as_running() {
+        let mut store = Store::open_in_memory().unwrap();
+        let start = at("2026-10-19T22:05:00Z");
+        let running = store
+            .create_run(&new_run(1, "add() subtracts"), start)
+            .unwrap()
+            .unwrap();
+        store
+            .start_attempt(running, "plan", 1, None, start)
+            .unwrap();
+        let tick = TickRecord {
+            at: start,
+            queue: vec![
+                QueuedIssue {
+                    repo: "octo/calc".into(),
+                    number: 1,
+                    title: "add() subtracts".into(),
+                },
+                QueuedIssue {
+                    repo: "octo/calc".into(),
+                    number: 7,
+                    title: "Support floats".into(),
+                },
+            ],
+            notes: Vec::new(),
+        };
+        store
+            .kv_set(LAST_TICK, &serde_json::to_string(&tick).unwrap())
+            .unwrap();
+        let board = Board::load(&store, at("2026-10-19T22:06:00Z")).unwrap();
+        let text = board.render(&config(), &TimeZone::UTC);
+        assert!(
+            text.contains("\nReady (1)\n  octo/calc#7  Support floats\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("\nRunning (1)\n  octo/calc#1  add() subtracts  (run 1, plan"),
+            "{text}"
+        );
     }
 
     #[test]

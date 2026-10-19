@@ -475,13 +475,9 @@ impl Factory {
             RunEnd::Published { branch, .. } => {
                 (Lifecycle::Review, format!("dsf pushed `{branch}`."))
             }
-            RunEnd::Blocked { run_id, reason } => (
-                Lifecycle::Blocked,
-                format!(
-                    "dsf stopped (run {run_id}): {reason}\n\n\
-                     Change the issue or the repository, then add `factory:ready` again to start over."
-                ),
-            ),
+            RunEnd::Blocked { run_id, reason } => {
+                (Lifecycle::Blocked, self.blocked_comment(*run_id, reason)?)
+            }
             RunEnd::PublishFailed { run_id, reason } => (
                 Lifecycle::Blocked,
                 format!("dsf finished the work but couldn't publish it (run {run_id}): {reason}"),
@@ -527,6 +523,31 @@ impl Factory {
             .post_comment(repo, number, &self.engine.mask(&comment))
             .await?;
         Ok(())
+    }
+
+    /// Why a run stopped. A plan that needs a decision is posted in full,
+    /// with the planner's questions, since answering them is how the issue
+    /// moves on.
+    fn blocked_comment(&self, run_id: i64, reason: &str) -> Result<String> {
+        let needs_decision = self
+            .engine
+            .store()?
+            .attempts(run_id)?
+            .last()
+            .is_some_and(|attempt| attempt.outcome.as_deref() == Some("needs_decision"));
+        let plan = self.engine.stored_run(run_id)?.plan;
+        Ok(match plan.filter(|_| needs_decision) {
+            Some(plan) => format!(
+                "dsf stopped (run {run_id}): the plan needs a decision from you before any code \
+                 is written.\n\n{plan}\n\n\
+                 Answer in a comment here, or edit the issue, then add `factory:ready` again. \
+                 The next run reads your comments."
+            ),
+            None => format!(
+                "dsf stopped (run {run_id}): {reason}\n\n\
+                 Change the issue or the repository, then add `factory:ready` again to start over."
+            ),
+        })
     }
 
     /// Posts the plan and waits for `factory:plan-approved`.

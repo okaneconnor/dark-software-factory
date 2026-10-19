@@ -429,6 +429,59 @@ async fn a_ready_issue_becomes_a_draft_pull_request() {
 }
 
 #[tokio::test]
+async fn a_plan_that_needs_a_decision_asks_its_questions() {
+    if !enabled() {
+        return;
+    }
+    let world = World::new("decision");
+    let fake = Fake::start().await;
+    fake.issue(
+        issue_json(
+            1,
+            "alice",
+            &["factory:ready"],
+            "Make add() better.\n\nfake-plan: needs_decision",
+        ),
+        json!([labelled("alice", "factory:ready", "2026-10-18T09:00:00Z")]),
+        json!([]),
+    )
+    .await;
+    fake.writable().await;
+
+    let outcome = world
+        .factory(&fake, "never")
+        .work_on(&repo(), 1)
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome, Outcome::Ended(RunEnd::Blocked { ref reason, .. }) if reason.contains("needs_decision")),
+        "{outcome:?}"
+    );
+    let requests = fake.requests().await;
+    let comment = requests
+        .iter()
+        .rfind(|(method, path, _)| method == "POST" && path.ends_with("/comments"))
+        .unwrap()
+        .2["body"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        comment.starts_with("dsf stopped (run 1): the plan needs a decision from you"),
+        "{comment}"
+    );
+    assert!(comment.contains("The issue is ambiguous."), "{comment}");
+    assert!(
+        comment.contains("Questions for the maintainer:\n- Should add() accept strings?"),
+        "{comment}"
+    );
+    assert!(
+        comment.ends_with("The next run reads your comments."),
+        "{comment}"
+    );
+}
+
+#[tokio::test]
 async fn a_plan_waits_for_a_trusted_approval_given_after_it() {
     if !enabled() {
         return;
