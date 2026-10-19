@@ -5,15 +5,24 @@
 //!
 //! 1. **Recover.** Runs a crash left mid-stage are marked interrupted, and
 //!    their containers removed, so they continue from their last
-//!    checkpoint.
-//! 2. **Look.** Each repo's queue of `factory:ready` issues is listed and
+//!    checkpoint. Finished runs' files older than `run_retention` go.
+//! 2. **Check the host.** Docker must have the worker image and the disk
+//!    enough room. If not, nothing starts or resumes: the problem is the
+//!    host's, and failing runs one after another would wrongly block them.
+//! 3. **Look.** Each repo's queue of `factory:ready` issues is listed and
 //!    saved for `dsf status`. Issues still labelled `factory:running` with
 //!    no run behind them are put right.
-//! 3. **Work.** If claiming is allowed (inside the window, not paused, not
-//!    backing off after a usage limit), paused runs carry on and queued
+//! 4. **Work.** If claiming is allowed (inside the window, not paused, the
+//!    host fit, not backing off), paused runs carry on and queued
 //!    issues are claimed, up to `workers` at once, until nothing is left
 //!    or claiming stops being allowed. Otherwise plans waiting for approval
 //!    are still checked, so one no one approves expires on time.
+//!
+//! Anything wrong with the factory itself, rather than one issue, is a
+//! *problem*: saved with the tick, recorded for the digest, and the reason
+//! `dsf tick` exits non-zero, so systemd shows the unit failed. A fault in
+//! a run (Docker or git failing under it) suspends the run to retry and
+//! backs claiming off, half an hour at first and up to four hours.
 //!
 //! Every decision uses the factory's clock, so tests can run a tick at any
 //! moment they like.
@@ -38,8 +47,10 @@ use crate::usage::UsageReading;
 /// `kv` key: why claiming is paused, if it is. Set by `dsf pause`, or by
 /// dsf itself when Claude stops accepting its token.
 pub const PAUSED: &str = "paused";
-/// `kv` key: no claiming before this time, after a usage limit.
+/// `kv` key: no claiming before this time, after a usage limit or a fault.
 pub const BACKOFF_UNTIL: &str = "backoff_until";
+/// `kv` key: what the backoff is after, e.g. `a usage limit`.
+pub const BACKOFF_REASON: &str = "backoff_reason";
 /// `kv` key: the last tick's [`TickRecord`].
 pub const LAST_TICK: &str = "last_tick";
 
@@ -51,6 +62,10 @@ pub struct TickRecord {
     pub queue: Vec<QueuedIssue>,
     /// What happened, one line each, masked.
     pub notes: Vec<String>,
+    /// What's wrong with the factory itself, masked. Any at all make
+    /// `dsf tick` exit non-zero.
+    #[serde(default)]
+    pub problems: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,45 +85,74 @@ enum Candidate {
 pub struct Scheduler {
     factory: Factory,
     tz: TimeZone,
+    check_host: bool,
 }
 
 impl Scheduler {
     pub fn new(factory: Factory, tz: TimeZone) -> Self {
-        Self { factory, tz }
+        Self {
+            factory,
+            tz,
+            check_host: true,
+        }
+    }
+
+    /// Takes the host as fit to run work without checking, for tests that
+    /// never start a container and may have no Docker to ask.
+    #[must_use]
+    pub fn without_host_checks(mut self) -> Self {
+        self.check_host = false;
+        self
     }
 
     pub fn factory(&self) -> &Factory {
         &self.factory
     }
 
-    /// One pass: recover, look, work. Problems with one repo or issue are
-    /// noted and the rest carry on; only the store or Docker failing stops
-    /// the tick.
+    /// One pass: recover, check the host, look, work. Problems with one
+    /// repo or issue are noted and the rest carry on; only the store or
+    /// Docker failing stops the tick.
     pub async fn tick(&self) -> Result<TickRecord> {
-        let mut notes = Vec::new();
+        let mut log = Log::default();
         for run_id in self.factory.engine().recover().await? {
-            notes.push(format!(
+            log.notes.push(format!(
                 "run {run_id} was interrupted; it continues from its last checkpoint"
             ));
         }
+        let config = self.factory.config();
+        match self.factory.engine().prune(config.run_retention) {
+            Ok(0) => {}
+            Ok(removed) => log.notes.push(format!(
+                "removed the files of {removed} run(s) finished over {} ago",
+                dsf_core::duration::format(config.run_retention)
+            )),
+            Err(error) => log
+                .problems
+                .push(format!("removing old runs' files: {error:#}")),
+        }
+        if self.check_host {
+            let min_free = u64::from(config.min_free_disk_gb).saturating_mul(1_000_000_000);
+            log.problems
+                .extend(self.factory.engine().preflight(min_free).await);
+        }
+        let healthy = log.problems.is_empty();
 
-        self.forget_unconfigured(&mut notes)?;
+        self.forget_unconfigured(&mut log.notes)?;
 
         let mut queues = Vec::new();
-        for repo in &self.factory.config().repos {
-            match self.look_at(&repo.slug, &mut notes).await {
+        for repo in &config.repos {
+            match self.look_at(&repo.slug, &mut log.notes).await {
                 Ok(queue) => queues.push(queue),
-                Err(error) => notes.push(format!("{}: {error:#}", repo.slug)),
+                Err(error) => log.problems.push(format!("{}: {error:#}", repo.slug)),
             }
         }
         let queue = round_robin(queues);
         // Saved now as well as at the end, so `dsf status` shows this tick's
         // queue while the tick works through it, which can take hours.
-        self.save(&queue, &notes)?;
+        self.save(&queue, &log)?;
 
         // Only runs on configured repos: `dsf run --local` may share the
         // state directory on a development machine.
-        let config = self.factory.config();
         let paused: Vec<store::Run> = self
             .factory
             .engine()
@@ -123,7 +167,7 @@ impl Scheduler {
                         .is_ok_and(|slug| config.repo(&slug).is_some())
             })
             .collect();
-        match self.decision(0)? {
+        match self.decision(0, healthy)? {
             ClaimDecision::Claim { .. } => {
                 let candidates = paused
                     .into_iter()
@@ -132,21 +176,26 @@ impl Scheduler {
                         Some(Candidate::Queued(issue.repo.parse().ok()?, issue.number))
                     }))
                     .collect();
-                self.work(candidates, &mut notes).await?;
+                self.work(candidates, &mut log).await?;
             }
             ClaimDecision::Wait(wait) => {
-                notes.push(self.describe(wait));
+                log.notes.push(self.describe(wait));
                 for run in paused
                     .iter()
                     .filter(|run| run.suspend_reason == Some(SuspendReason::Approval))
                 {
                     let outcome = self.factory.continue_run(run, false).await;
-                    self.record(&format!("{}#{}", run.repo, run.issue), outcome, &mut notes)?;
+                    self.record(&format!("{}#{}", run.repo, run.issue), outcome, &mut log)?;
                 }
             }
         }
 
-        self.save(&queue, &notes)
+        let record = self.save(&queue, &log)?;
+        let mut store = self.factory.engine().store()?;
+        for problem in &record.problems {
+            store.problem(problem, record.at)?;
+        }
+        Ok(record)
     }
 
     /// Cancels the unfinished runs of repos taken out of the config, so
@@ -181,14 +230,18 @@ impl Scheduler {
     }
 
     /// Records what this tick has seen and done so far, for `dsf status`.
-    fn save(&self, queue: &[QueuedIssue], notes: &[String]) -> Result<TickRecord> {
+    fn save(&self, queue: &[QueuedIssue], log: &Log) -> Result<TickRecord> {
+        let mask = |lines: &[String]| -> Vec<String> {
+            lines
+                .iter()
+                .map(|line| self.factory.engine().mask(line))
+                .collect()
+        };
         let record = TickRecord {
             at: self.factory.now(),
             queue: queue.to_vec(),
-            notes: notes
-                .iter()
-                .map(|note| self.factory.engine().mask(note))
-                .collect(),
+            notes: mask(&log.notes),
+            problems: mask(&log.problems),
         };
         self.factory
             .engine()
@@ -234,17 +287,19 @@ impl Scheduler {
 
     /// Runs candidates, up to `workers` at once, while claiming is
     /// allowed. Each run's end is acted on before the next claim: a usage
-    /// limit starts a backoff, and a token Claude won't accept pauses the
-    /// factory, so neither burns through the rest of the queue.
-    async fn work(&self, candidates: Vec<Candidate>, notes: &mut Vec<String>) -> Result<()> {
+    /// limit or a fault starts a backoff, and a token Claude won't accept
+    /// pauses the factory, so none of them burns through the rest of the
+    /// queue.
+    async fn work(&self, candidates: Vec<Candidate>, log: &mut Log) -> Result<()> {
         let workers = self.factory.config().workers;
         let mut pending: VecDeque<Candidate> = candidates.into();
         let mut running = FuturesUnordered::new();
         let mut stopped = false;
         loop {
             while !stopped && running.len() < workers {
-                if let ClaimDecision::Wait(wait) = self.decision(running.len())? {
-                    notes.push(format!("stopped claiming: {}", self.describe(wait)));
+                if let ClaimDecision::Wait(wait) = self.decision(running.len(), true)? {
+                    log.notes
+                        .push(format!("stopped claiming: {}", self.describe(wait)));
                     stopped = true;
                     break;
                 }
@@ -256,7 +311,7 @@ impl Scheduler {
             let Some((label, outcome)) = running.next().await else {
                 break;
             };
-            self.record(&label, outcome, notes)?;
+            self.record(&label, outcome, log)?;
         }
         Ok(())
     }
@@ -275,38 +330,41 @@ impl Scheduler {
     }
 
     /// Notes an outcome and acts on how a run ended.
-    fn record(&self, label: &str, outcome: Result<Outcome>, notes: &mut Vec<String>) -> Result<()> {
+    fn record(&self, label: &str, outcome: Result<Outcome>, log: &mut Log) -> Result<()> {
         let end = match outcome {
             Err(error) => {
-                notes.push(format!("{label}: {error:#}"));
+                // Something failed outside any run's stages, e.g. GitHub or
+                // Docker when resuming. Trying the next issue at once would
+                // likely fail the same way.
+                let until = self.factory.engine().fault_backoff()?;
+                log.problems.push(format!("{label}: {error:#}"));
+                self.back_off(until, "a fault")?;
                 return Ok(());
             }
             Ok(Outcome::Skipped(reason)) => {
-                notes.push(reason);
+                log.notes.push(reason);
                 return Ok(());
             }
             Ok(Outcome::AwaitingApproval { run_id }) => {
-                notes.push(format!(
+                log.notes.push(format!(
                     "{label}: run {run_id} is waiting for plan approval"
                 ));
                 return Ok(());
             }
             Ok(Outcome::Ended(end)) => end,
         };
-        notes.push(format!("{label}: {}", summarise(&end)));
-        let mut store = self.factory.engine().store()?;
         match &end {
+            RunEnd::Faulted { retry_after, .. } => {
+                log.problems.push(format!("{label}: {}", summarise(&end)));
+                self.back_off(*retry_after, "a fault")?;
+            }
             RunEnd::Suspended {
                 reason: SuspendReason::UsageLimit,
                 resume_after: Some(until),
                 ..
             } => {
-                let current = store
-                    .kv_get(BACKOFF_UNTIL)?
-                    .and_then(|text| text.parse::<Timestamp>().ok());
-                if current.is_none_or(|current| current < *until) {
-                    store.kv_set(BACKOFF_UNTIL, &until.to_string())?;
-                }
+                log.notes.push(format!("{label}: {}", summarise(&end)));
+                self.back_off(*until, "a usage limit")?;
             }
             RunEnd::Suspended {
                 run_id,
@@ -314,20 +372,39 @@ impl Scheduler {
                 detail,
                 ..
             } => {
-                store.kv_set(PAUSED, &format!("run {run_id}: {detail}"))?;
+                log.problems.push(format!("{label}: {}", summarise(&end)));
+                self.factory
+                    .engine()
+                    .store()?
+                    .kv_set(PAUSED, &format!("run {run_id}: {detail}"))?;
             }
-            _ => {}
+            _ => log.notes.push(format!("{label}: {}", summarise(&end))),
         }
         Ok(())
     }
 
-    /// Whether another run may start now, with `active` already running.
-    fn decision(&self, active: usize) -> Result<ClaimDecision> {
+    /// No claiming until `until`, unless a longer backoff is already set.
+    fn back_off(&self, until: Timestamp, after: &str) -> Result<()> {
+        let mut store = self.factory.engine().store()?;
+        let current = store
+            .kv_get(BACKOFF_UNTIL)?
+            .and_then(|text| text.parse::<Timestamp>().ok());
+        if current.is_none_or(|current| current < until) {
+            store.kv_set(BACKOFF_UNTIL, &until.to_string())?;
+            store.kv_set(BACKOFF_REASON, after)?;
+        }
+        Ok(())
+    }
+
+    /// Whether another run may start now, with `active` already running
+    /// and the host found `healthy` at the start of the tick.
+    fn decision(&self, active: usize, healthy: bool) -> Result<ClaimDecision> {
         let store = self.factory.engine().store()?;
         let now = self.factory.now();
         let config = self.factory.config();
         let state = ClaimState {
             paused: store.kv_get(PAUSED)?.is_some(),
+            healthy,
             backoff_until: store
                 .kv_get(BACKOFF_UNTIL)?
                 .map(|text| text.parse::<Timestamp>())
@@ -358,10 +435,19 @@ impl Scheduler {
                     .unwrap_or_default();
                 format!("claiming is paused ({reason}); `dsf unpause` restarts it")
             }
-            Wait::BackingOff { until } => format!(
-                "backing off after a usage limit until {}",
-                local(until, &self.tz)
-            ),
+            Wait::Unhealthy => {
+                "not starting anything: this host can't run work (see the problems)".to_owned()
+            }
+            Wait::BackingOff { until } => {
+                let after = self
+                    .factory
+                    .engine()
+                    .store()
+                    .ok()
+                    .and_then(|store| store.kv_get(BACKOFF_REASON).ok().flatten())
+                    .unwrap_or_else(|| "a usage limit".to_owned());
+                format!("backing off after {after} until {}", local(until, &self.tz))
+            }
             Wait::OverUsageCap { until } => {
                 let cap = self.factory.config().weekly_usage_cap;
                 let why = self
@@ -411,7 +497,19 @@ fn summarise(end: &RunEnd) -> String {
             ..
         } => format!("run {run_id} paused until {after}: {detail}"),
         RunEnd::Suspended { run_id, detail, .. } => format!("run {run_id} paused: {detail}"),
+        RunEnd::Faulted {
+            run_id,
+            detail,
+            retry_after,
+        } => format!("run {run_id} hit a fault and tries again after {retry_after}: {detail}"),
     }
+}
+
+/// What a tick has to say so far.
+#[derive(Default)]
+struct Log {
+    notes: Vec<String>,
+    problems: Vec<String>,
 }
 
 /// Interleaves per-repo queues, so one busy repo can't starve the rest.

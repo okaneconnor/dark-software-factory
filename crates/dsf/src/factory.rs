@@ -445,12 +445,7 @@ impl Factory {
     /// is recorded rather than returned: the run's own state is saved, and
     /// the labels can be put right later.
     async fn report(&self, repo: &RepoSlug, number: u64, end: &RunEnd) {
-        let run_id = match end {
-            RunEnd::Published { run_id, .. }
-            | RunEnd::Blocked { run_id, .. }
-            | RunEnd::Suspended { run_id, .. }
-            | RunEnd::PublishFailed { run_id, .. } => *run_id,
-        };
+        let run_id = end.run_id();
         if let Err(error) = self.try_report(repo, number, end).await {
             self.engine.note(
                 run_id,
@@ -505,6 +500,10 @@ impl Factory {
                 }
                 (Lifecycle::Ready, comment)
             }
+            // The issue stays `factory:running`: the run carries on by
+            // itself once the host is fit again, and the fault is dsf's to
+            // report, in the tick's problems and the digest, not the issue's.
+            RunEnd::Faulted { .. } => return Ok(()),
             RunEnd::Suspended {
                 run_id,
                 reason: SuspendReason::Interrupted,

@@ -25,8 +25,10 @@ const FIRST_LOOKBACK: SignedDuration = SignedDuration::from_hours(24);
 /// A digest never reaches back further than this, however long it's been.
 const MAX_LOOKBACK: SignedDuration = SignedDuration::from_hours(7 * 24);
 /// Ticks run every few minutes; a last tick older than this means the
-/// timer has stopped.
+/// timer has stopped or every tick is failing.
 const STALE_TICK: SignedDuration = SignedDuration::from_hours(1);
+/// Different problems listed before the rest are only counted.
+const MAX_PROBLEMS: usize = 5;
 const POST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Slack's limits on a section's text and a header's.
 const SLACK_SECTION_MAX: usize = 3000;
@@ -63,6 +65,8 @@ pub struct Digest {
     board: Board,
     /// Runs finished since `since`, most recent first.
     finished: Vec<Run>,
+    /// Problems ticks recorded since `since`, oldest first.
+    problems: Vec<(Timestamp, String)>,
 }
 
 /// A digest ready to print or post.
@@ -102,12 +106,39 @@ impl Digest {
             since,
             board: Board::load(store, now)?,
             finished: store.finished_since(since)?,
+            problems: store.problems_since(since)?,
         })
     }
 
     /// Records that this digest went out, so the next starts from here.
     pub fn sent(store: &mut Store, at: Timestamp) -> Result<()> {
         store.kv_set(LAST_DIGEST, &at.to_string())
+    }
+
+    /// What needs a person: ticks that stopped, a pause, and problems.
+    fn warnings(&self, tz: &TimeZone) -> Vec<String> {
+        let mut warnings = Vec::new();
+        let stale_after = self
+            .board
+            .now
+            .checked_sub(STALE_TICK)
+            .unwrap_or(self.board.now);
+        match &self.board.last_tick {
+            None => warnings.push("dsf has never ticked; is dsf-tick.timer enabled?".to_owned()),
+            Some(tick) if tick.at < stale_after => warnings.push(format!(
+                "no tick has finished since {}; check `systemctl status dsf-tick.timer` \
+                 and `journalctl -u dsf-tick`",
+                local(tick.at, tz)
+            )),
+            Some(_) => {}
+        }
+        if let Some(reason) = &self.board.paused {
+            warnings.push(format!(
+                "claiming is paused ({reason}); `dsf unpause` restarts it"
+            ));
+        }
+        warnings.extend(problem_lines(&self.problems, tz));
+        warnings
     }
 
     pub fn summarise(&self, config: &Config, tz: &TimeZone) -> Summary {
@@ -165,25 +196,7 @@ impl Digest {
             format!("dsf: {}", counts.join(", "))
         };
 
-        let mut warnings = Vec::new();
-        let stale_after = self
-            .board
-            .now
-            .checked_sub(STALE_TICK)
-            .unwrap_or(self.board.now);
-        match &self.board.last_tick {
-            None => warnings.push("dsf has never ticked; is dsf-tick.timer enabled?".to_owned()),
-            Some(tick) if tick.at < stale_after => warnings.push(format!(
-                "no tick since {}; is dsf-tick.timer running?",
-                local(tick.at, tz)
-            )),
-            Some(_) => {}
-        }
-        if let Some(reason) = &self.board.paused {
-            warnings.push(format!(
-                "claiming is paused ({reason}); `dsf unpause` restarts it"
-            ));
-        }
+        let warnings = self.warnings(tz);
 
         let sections = [
             ("Draft PRs", published),
@@ -215,6 +228,40 @@ impl Digest {
             ],
         }
     }
+}
+
+/// Each different problem once, most recent first, with how often and
+/// when it last happened. A host problem repeats every tick until fixed.
+fn problem_lines(problems: &[(Timestamp, String)], tz: &TimeZone) -> Vec<String> {
+    let mut seen: Vec<(&str, usize, Timestamp)> = Vec::new();
+    for (at, message) in problems.iter().rev() {
+        match seen
+            .iter_mut()
+            .find(|(known, ..)| *known == message.as_str())
+        {
+            Some((_, count, _)) => *count += 1,
+            None => seen.push((message, 1, *at)),
+        }
+    }
+    let mut lines: Vec<String> = seen
+        .iter()
+        .take(MAX_PROBLEMS)
+        .map(|(message, count, last)| {
+            let times = if *count == 1 {
+                format!("at {}", local(*last, tz))
+            } else {
+                format!("{count} times, last at {}", local(*last, tz))
+            };
+            format!("problem ({times}): {message}")
+        })
+        .collect();
+    if seen.len() > MAX_PROBLEMS {
+        lines.push(format!(
+            "and {} other problem(s); see `journalctl -u dsf-tick`",
+            seen.len() - MAX_PROBLEMS
+        ));
+    }
+    lines
 }
 
 impl Summary {
@@ -460,6 +507,7 @@ mod tests {
                 title: "Support floats".into(),
             }],
             notes: Vec::new(),
+            problems: Vec::new(),
         };
         store
             .kv_set(LAST_TICK, &serde_json::to_string(&record).unwrap())
@@ -586,12 +634,46 @@ mod tests {
         assert_eq!(
             summary.warnings,
             [
-                "no tick since Tue 20 Oct 04:00; is dsf-tick.timer running?",
+                "no tick has finished since Tue 20 Oct 04:00; check `systemctl status \
+                 dsf-tick.timer` and `journalctl -u dsf-tick`",
                 "claiming is paused (maintenance); `dsf unpause` restarts it"
             ]
         );
         // Never more than a week back.
         assert_eq!(summary.period, "Since Tue 13 Oct 07:00 (Europe/London)");
+    }
+
+    #[test]
+    fn problems_are_listed_once_each_most_recent_first() {
+        let mut store = Store::open_in_memory().unwrap();
+        tick(&mut store, "2026-10-20T05:55:00Z");
+        store.kv_set(LAST_DIGEST, "2026-10-19T06:00:00Z").unwrap();
+        // From before the last digest, so not this one's business.
+        store
+            .problem("old news", at("2026-10-19T05:00:00Z"))
+            .unwrap();
+        for when in [
+            "2026-10-19T23:00:00Z",
+            "2026-10-19T23:05:00Z",
+            "2026-10-19T23:10:00Z",
+        ] {
+            store
+                .problem("the worker image w isn't on this host", at(when))
+                .unwrap();
+        }
+        store
+            .problem("octo/calc#7: GitHub said 502", at("2026-10-20T01:00:00Z"))
+            .unwrap();
+        let summary = Digest::load(&store, at("2026-10-20T06:00:00Z"))
+            .unwrap()
+            .summarise(&config(), &london());
+        assert_eq!(
+            summary.warnings,
+            [
+                "problem (at Tue 20 Oct 02:00): octo/calc#7: GitHub said 502",
+                "problem (3 times, last at Tue 20 Oct 00:10): the worker image w isn't on this host",
+            ]
+        );
     }
 
     #[test]

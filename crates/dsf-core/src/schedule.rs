@@ -1,6 +1,6 @@
-//! When the factory may claim work: the daily window, usage-limit backoff,
-//! the weekly usage cap and worker capacity. Times are passed in, never
-//! read from a clock.
+//! When the factory may claim work: the daily window, backing off after a
+//! usage limit or a fault, the weekly usage cap, the host's health and
+//! worker capacity. Times are passed in, never read from a clock.
 
 use std::cmp::Ordering;
 
@@ -13,7 +13,7 @@ const RESET_GRACE: SignedDuration = SignedDuration::from_mins(2);
 /// A reported reset further away than this is treated as a mistake. Weekly
 /// subscription limits can legitimately be days away.
 const MAX_RESET_WAIT: SignedDuration = SignedDuration::from_hours(8 * 24);
-/// When no reset time is known: 30m, 1h, 2h, then 4h at most.
+/// Backoff without a known end: 30m, 1h, 2h, then 4h at most.
 const FIRST_BACKOFF: SignedDuration = SignedDuration::from_mins(30);
 const MAX_BACKOFF: SignedDuration = SignedDuration::from_hours(4);
 
@@ -91,15 +91,20 @@ pub fn usage_limit_resume(
             let latest = add(now, MAX_RESET_WAIT);
             add(reset, RESET_GRACE).min(latest)
         }
-        _ => {
-            let doublings = consecutive.saturating_sub(1).min(8);
-            let backoff = FIRST_BACKOFF
-                .checked_mul(1 << doublings)
-                .unwrap_or(MAX_BACKOFF)
-                .min(MAX_BACKOFF);
-            add(now, backoff)
-        }
+        _ => backoff(now, consecutive),
     }
+}
+
+/// When to try again after `consecutive` failures in a row with no known
+/// end, starting at 1: half an hour, doubling to four hours at most. Used
+/// after a usage limit with no reset time, and after dsf itself fails.
+pub fn backoff(now: Timestamp, consecutive: u32) -> Timestamp {
+    let doublings = consecutive.saturating_sub(1).min(8);
+    let wait = FIRST_BACKOFF
+        .checked_mul(1 << doublings)
+        .unwrap_or(MAX_BACKOFF)
+        .min(MAX_BACKOFF);
+    add(now, wait)
 }
 
 /// While the weekly allowance is used to `cap` percent or more, when work
@@ -126,6 +131,9 @@ fn add(timestamp: Timestamp, duration: SignedDuration) -> Timestamp {
 pub struct ClaimState {
     /// Set by the operator to stop all new work.
     pub paused: bool,
+    /// Whether the host can run work at all: Docker has the worker image
+    /// and the disk has room. Checked every tick.
+    pub healthy: bool,
     pub backoff_until: Option<Timestamp>,
     /// From [`usage_cap_until`].
     pub usage_capped_until: Option<Timestamp>,
@@ -145,6 +153,7 @@ pub enum ClaimDecision {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Wait {
     Paused,
+    Unhealthy,
     BackingOff { until: Timestamp },
     OverUsageCap { until: Timestamp },
     WindowClosed { opens_at: Timestamp },
@@ -162,6 +171,9 @@ pub fn claim_decision(
 ) -> ClaimDecision {
     if state.paused {
         return ClaimDecision::Wait(Wait::Paused);
+    }
+    if !state.healthy {
+        return ClaimDecision::Wait(Wait::Unhealthy);
     }
     // Both can apply at once; the later one is the real wait.
     let backoff = state.backoff_until.filter(|until| *until > now);
@@ -320,15 +332,17 @@ mod tests {
             at("2026-10-19T03:00:00Z")
         );
         assert_eq!(usage_limit_resume(now, None, 0), at("2026-10-18T23:30:00Z"));
+        assert_eq!(backoff(now, 3), at("2026-10-19T01:00:00Z"));
     }
 
     #[test]
-    fn claim_decision_checks_pause_backoff_window_then_capacity() {
+    fn claim_decision_checks_pause_health_backoff_window_then_capacity() {
         let tz = london();
         let window = overnight();
         let night = at("2026-12-01T23:30:00Z");
         let idle = ClaimState {
             paused: false,
+            healthy: true,
             backoff_until: None,
             usage_capped_until: None,
             active_runs: 0,
@@ -381,6 +395,27 @@ mod tests {
             claim_decision(night, &tz, &window, 2, &paused),
             ClaimDecision::Wait(Wait::Paused)
         );
+        let unhealthy = ClaimState {
+            healthy: false,
+            ..backing_off
+        };
+        assert_eq!(
+            claim_decision(night, &tz, &window, 2, &unhealthy),
+            ClaimDecision::Wait(Wait::Unhealthy)
+        );
+        assert_eq!(
+            claim_decision(
+                night,
+                &tz,
+                &window,
+                2,
+                &ClaimState {
+                    paused: true,
+                    ..unhealthy
+                }
+            ),
+            ClaimDecision::Wait(Wait::Paused)
+        );
 
         let noon = at("2026-12-01T12:00:00Z");
         assert_eq!(
@@ -399,6 +434,7 @@ mod tests {
         let later = at("2026-12-04T09:02:00Z");
         let state = |backoff, capped| ClaimState {
             paused: false,
+            healthy: true,
             backoff_until: backoff,
             usage_capped_until: capped,
             active_runs: 0,
