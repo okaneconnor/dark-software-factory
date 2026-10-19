@@ -9,11 +9,13 @@
 
 mod support;
 
+use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use dsf::engine::{Config, Egress, Engine, Issue, ResumeOptions, RunEnd};
+use dsf::packs::Pack;
 use dsf::store::{Store, SuspendReason};
 use dsf_core::clamp::Caps;
 use support::{FAKE_IMAGE, TOKEN, enabled, git};
@@ -452,6 +454,70 @@ on = { success = "@publish", failure = "@blocked" }
         panic!("{end:?}")
     };
     assert_eq!(world.stages(run_id), ["implement", "verify"]);
+}
+
+/// The repository's instructions and the operator's packs reach the
+/// agent: the system-prompt file, each pack as a plugin, the Skill tool.
+#[tokio::test]
+async fn agents_get_the_repos_instructions_and_the_operators_packs() {
+    if !enabled() {
+        return;
+    }
+    let world = World::new("packs");
+    std::fs::write(
+        world.origin.join("CLAUDE.md"),
+        "Always write tests. (house-rule-7)\n",
+    )
+    .unwrap();
+    git(&world.origin, &["add", "--all"]);
+    git(&world.origin, &["commit", "--quiet", "-m", "instructions"]);
+    let packs = tempfile::tempdir().unwrap();
+    let pack = packs.path().canonicalize().unwrap().join("house");
+    std::fs::create_dir_all(pack.join(".claude-plugin")).unwrap();
+    std::fs::create_dir_all(pack.join("skills/style")).unwrap();
+    std::fs::write(
+        pack.join(".claude-plugin/plugin.json"),
+        r#"{"name": "house"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        pack.join("rules.md"),
+        "Name things clearly. (pack-rule-3)\n",
+    )
+    .unwrap();
+    std::fs::write(
+        pack.join("skills/style/SKILL.md"),
+        "---\nname: style\n---\nBe clear.\n",
+    )
+    .unwrap();
+
+    let end = world
+        .engine("fake")
+        .with_packs(HashMap::from([(
+            "local/calc".to_owned(),
+            vec![Pack::at(&pack).unwrap()],
+        )]))
+        .start(&world.issue("fake-implement: record-context"))
+        .await
+        .unwrap();
+    assert!(matches!(end, RunEnd::Published { .. }), "{end:?}");
+    let context = world.published("context.txt").unwrap();
+    for expected in [
+        "--tools Read,Grep,Glob,Edit,Write,Bash,Skill",
+        "--append-system-prompt-file /dsf/system.md",
+        "--plugin-dir /dsf/packs/house",
+        "--add-dir /dsf/packs/house",
+        "# Repository instructions",
+        "## CLAUDE.md\n\nAlways write tests. (house-rule-7)",
+        "# Standards: house\n\nName things clearly. (pack-rule-3)",
+        "named `house:<skill>`",
+        "--- /dsf/packs\nhouse",
+    ] {
+        assert!(
+            context.contains(expected),
+            "{expected:?} not in:\n{context}"
+        );
+    }
 }
 
 /// kill -9 the CLI mid-stage, then resume: the orphaned container is

@@ -37,6 +37,9 @@ app_id = 123456
 name = "your-github-login/example-repo"
 # never | label (only issues labelled factory:approve-plan) | always
 approval = "label"
+# Standards packs for this repo's agents, by directory name under
+# [packs] dir. See examples/packs/.
+packs = []
 
 [caps]
 # Upper bounds on what a repo's .factory/workflow.toml may ask for.
@@ -56,6 +59,11 @@ allow = ["registry.npmjs.org", "pypi.org", "files.pythonhosted.org", "index.crat
 worker = "ghcr.io/your-github-login/dsf-worker:v0.1.0"
 # dsf's own image, which the egress proxy sidecar runs.
 dsf = "ghcr.io/your-github-login/dsf:v0.1.0"
+
+[packs]
+# Where standards packs live: one Claude Code plugin directory per pack,
+# each optionally with a rules.md. Needed only if a repo names packs.
+# dir = "/etc/dsf/packs"
 
 [protect]
 # Paths agents may not change, in addition to .factory/, .github/,

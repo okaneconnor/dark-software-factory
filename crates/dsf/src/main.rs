@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
@@ -110,6 +111,11 @@ struct RunArgs {
     /// Make gate stages wait for approval.
     #[arg(long, requires = "local")]
     require_approval: bool,
+    /// A standards pack for a local run: a Claude Code plugin directory,
+    /// optionally with a rules.md. Repeat for more. GitHub runs take their
+    /// packs from the config.
+    #[arg(long = "pack", value_name = "DIR", conflicts_with = "issue")]
+    packs: Vec<PathBuf>,
     #[command(flatten)]
     worker: WorkerArgs,
 }
@@ -439,21 +445,31 @@ async fn run_issue_async(args: &RunArgs) -> Result<Outcome> {
     let store = dsf::store::Store::open(&state_dir.join("dsf.sqlite"))?;
     let report = Box::new(|line: &str| println!("{line}"));
     let engine = Engine::new(config, store, sandbox, dsf::hostgit::Git::locate()?, report)?;
-    let end = match args.resume {
-        Some(run_id) => {
-            if !engine.stored_run(run_id)?.repo.starts_with("local/") {
-                bail!("run {run_id} is a GitHub run; continue it with `dsf run OWNER/REPO#N`");
-            }
-            engine
-                .resume(
-                    run_id,
-                    ResumeOptions {
-                        approve: args.approve,
-                    },
-                )
-                .await?
+    let packs = args
+        .packs
+        .iter()
+        .map(|dir| dsf::packs::Pack::at(dir))
+        .collect::<Result<Vec<_>>>()?;
+    let end = if let Some(run_id) = args.resume {
+        let repo = engine.stored_run(run_id)?.repo;
+        if !repo.starts_with("local/") {
+            bail!("run {run_id} is a GitHub run; continue it with `dsf run OWNER/REPO#N`");
         }
-        None => engine.start(&local_issue(args)?).await?,
+        engine
+            .with_packs(HashMap::from([(repo, packs)]))
+            .resume(
+                run_id,
+                ResumeOptions {
+                    approve: args.approve,
+                },
+            )
+            .await?
+    } else {
+        let issue = local_issue(args)?;
+        engine
+            .with_packs(HashMap::from([(issue.repo.clone(), packs)]))
+            .start(&issue)
+            .await?
     };
     if let RunEnd::Suspended { run_id, .. } = &end {
         println!("resume with: dsf run --resume {run_id}");
@@ -522,7 +538,8 @@ async fn github_factory(
         dsf::hostgit::Git::locate()?,
         report,
     )?
-    .with_forge(Box::new(dsf::factory::GitHubForge::new(github.clone())));
+    .with_forge(Box::new(dsf::factory::GitHubForge::new(github.clone())))
+    .with_packs(repo_packs(&config));
     let mut factory = dsf::factory::Factory::new(engine, github, config, &worker.github.git_base);
     if let Some(now) = worker.now {
         factory = factory.with_clock(Arc::new(move || now));
@@ -649,6 +666,7 @@ fn doctor(args: &WorkerArgs) -> Result<()> {
         .clone()
         .unwrap_or_else(|| config.state_dir.clone());
     checks.push(doctor::state_dir(&state));
+    checks.extend(doctor::packs(&config));
 
     let token = match &args.token_file {
         Some(file) => file.clone(),
@@ -815,6 +833,26 @@ fn claude_token(args: &WorkerArgs, home: Option<&Path>) -> Result<secrecy::Secre
         // Offline runs use fake agents, which need no token.
         (None, EgressArg::None) => Ok(secrecy::SecretString::from("offline-no-token")),
     }
+}
+
+/// Each configured repo's standards packs, from the config's `packs.dir`.
+fn repo_packs(config: &Config) -> HashMap<String, Vec<dsf::packs::Pack>> {
+    let Some(dir) = &config.packs_dir else {
+        return HashMap::new();
+    };
+    config
+        .repos
+        .iter()
+        .filter(|repo| !repo.packs.is_empty())
+        .map(|repo| {
+            let packs = repo
+                .packs
+                .iter()
+                .map(|name| dsf::packs::Pack::named(dir, name))
+                .collect();
+            (repo.slug.to_string(), packs)
+        })
+        .collect()
 }
 
 /// The image the proxy sidecar runs: `--dsf-image`, the config's

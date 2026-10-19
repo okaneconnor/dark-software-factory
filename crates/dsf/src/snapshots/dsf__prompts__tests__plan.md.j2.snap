@@ -28,4 +28,6 @@ Explore the code until you understand what has to change, then return:
 - `steps`: the concrete changes in order, naming the files involved.
 - `questions`: for `needs_decision`, exactly what the maintainer has to answer.
 
+Plan within the repository's instructions and any standards in your system prompt; if a standards pack skill covers this work, load it first.
+
 The change will be checked by `.factory/verify.sh`, so plan for it to pass. Don't plan changes to .factory/, .github/, .claude/, .mcp.json: they are rejected.

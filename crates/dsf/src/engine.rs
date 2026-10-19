@@ -12,6 +12,7 @@
 //! git credentials and opens the pull request through [`Forge`]; claiming
 //! issues and keeping their labels current is `factory`'s job.
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -34,6 +35,7 @@ use serde_json::Value;
 use crate::agent::{self, AgentOutcome, Invocation};
 use crate::hostgit::{Auth, Git, GitError, HostGit, Sha};
 use crate::masker::Masker;
+use crate::packs::{self, Pack};
 use crate::prompts::{self, Comment, Prompts};
 use crate::rundir::RunDir;
 use crate::sandbox::{
@@ -185,6 +187,8 @@ pub struct Engine {
     sandbox: Sandbox,
     git: Git,
     forge: Box<dyn Forge>,
+    /// Standards packs for each repo, keyed by its lowercase name.
+    packs: HashMap<String, Vec<Pack>>,
     masker: Masker,
     /// `uid:gid` containers run as: the owner of the state directory.
     user: String,
@@ -208,6 +212,9 @@ struct Run {
     verify_output: Option<String>,
     review: Option<String>,
     approve_gate: bool,
+    /// The repository's instructions for agents, read from the base commit
+    /// when the run started.
+    instructions: String,
 }
 
 enum StageResult {
@@ -242,6 +249,14 @@ impl Ended {
     }
 }
 
+/// What an agent stage is given beyond its prompt.
+struct StageContext {
+    system_prompt_file: Option<&'static str>,
+    plugin_dirs: Vec<String>,
+    skills: bool,
+    binds: Vec<Bind>,
+}
+
 /// What the loop does after a stage boundary.
 enum Step {
     Next(Next),
@@ -270,6 +285,7 @@ impl Engine {
             sandbox,
             git,
             forge: Box::new(NoForge),
+            packs: HashMap::new(),
             masker,
             user,
             report,
@@ -285,6 +301,23 @@ impl Engine {
 
     pub fn now(&self) -> Timestamp {
         (self.clock)()
+    }
+
+    /// Gives each repo's agents its standards packs. Keys are repo names as
+    /// issues carry them, compared case-insensitively.
+    #[must_use]
+    pub fn with_packs(mut self, packs: HashMap<String, Vec<Pack>>) -> Self {
+        self.packs = packs
+            .into_iter()
+            .map(|(repo, packs)| (repo.to_ascii_lowercase(), packs))
+            .collect();
+        self
+    }
+
+    fn packs_for(&self, repo: &str) -> &[Pack] {
+        self.packs
+            .get(&repo.to_ascii_lowercase())
+            .map_or(&[], Vec::as_slice)
     }
 
     #[must_use]
@@ -459,6 +492,8 @@ impl Engine {
         repo.reset_to(&checkpoint).await?;
         let (workflow, _) = Workflow::parse(&stored.workflow)?.clamp(&self.config.caps)?;
         let prompts = Prompts::from_snapshot(&dir.factory_snapshot())?;
+        // Runs from before instructions were saved simply have none.
+        let instructions = std::fs::read_to_string(dir.instructions()).unwrap_or_default();
         let (verify_output, review) = self.handoff(run_id, &dir, &workflow)?;
         let (protected, protected_list) = self.protected();
         let issue = Issue {
@@ -488,6 +523,7 @@ impl Engine {
             verify_output,
             review,
             approve_gate: options.approve,
+            instructions,
         };
         self.event(run_id, "resumed", &format!("from {}", run.checkpoint));
         let mut progress = stored.progress;
@@ -565,6 +601,14 @@ impl Engine {
             Ok(prompts) => prompts,
             Err(error) => return Ok(Setup::Blocked(format!("prompt templates: {error:#}"))),
         };
+        // From git objects at the base commit: an agent's edits to them
+        // can't change what later stages are told.
+        let instructions = match repo.instruction_files(&base).await {
+            Ok(files) => packs::repo_instructions(&files, base.as_str()),
+            Err(GitError::Failed(error)) => return Err(error),
+            Err(refused) => return Ok(Setup::Blocked(refused.to_string())),
+        };
+        std::fs::write(dir.instructions(), &instructions)?;
         let (protected, protected_list) = self.protected();
         Ok(Setup::Ready(Box::new(Run {
             id: run_id,
@@ -581,6 +625,7 @@ impl Engine {
             verify_output: None,
             review: None,
             approve_gate: false,
+            instructions,
         })))
     }
 
@@ -916,14 +961,21 @@ impl Engine {
     ) -> Result<StageResult> {
         let prompt = self.render_prompt(run, visit, prompt_name, schema).await?;
         std::fs::write(attempt_dir.join("prompt.md"), &prompt)?;
+        let context = match self.stage_context(run, attempt_dir)? {
+            Ok(context) => context,
+            Err(reason) => return Ok(StageResult::Block(reason)),
+        };
         let argv = agent::command_line(&Invocation {
             mode,
             prompt: &prompt,
             model: &self.config.model,
             schema,
             max_turns: self.config.max_turns,
+            system_prompt_file: context.system_prompt_file,
+            plugin_dirs: &context.plugin_dirs,
+            skills: context.skills,
         })?;
-        let spec = self.agent_spec(run, attempt, argv, mode);
+        let spec = self.agent_spec(run, attempt, argv, mode, context.binds);
         let stream_path = attempt_dir.join("stream.jsonl");
         let finished = self
             .sandbox
@@ -997,6 +1049,45 @@ impl Engine {
                 })
             }
         }
+    }
+
+    /// What an agent is given beyond its prompt: the repository's
+    /// instructions and the packs' rules as a system-prompt file, and the
+    /// packs themselves as plugins, all mounted read-only. `Err` is a reason
+    /// to block: a pack the config names is unusable.
+    fn stage_context(
+        &self,
+        run: &Run,
+        attempt_dir: &Path,
+    ) -> Result<std::result::Result<StageContext, String>> {
+        let packs = self.packs_for(&run.issue.repo);
+        for pack in packs {
+            if let Err(error) = pack.check() {
+                return Ok(Err(format!("{error:#}")));
+            }
+        }
+        let system = packs::system_prompt(&run.instructions, packs)?;
+        let mut binds = Vec::new();
+        if !system.is_empty() {
+            let path = attempt_dir.join("system.md");
+            std::fs::write(&path, &system)?;
+            binds.push(Bind {
+                source: path,
+                target: packs::SYSTEM_PROMPT_PATH.to_owned(),
+                read_only: true,
+            });
+        }
+        binds.extend(packs.iter().map(|pack| Bind {
+            source: pack.dir.clone(),
+            target: pack.container_dir(),
+            read_only: true,
+        }));
+        Ok(Ok(StageContext {
+            system_prompt_file: (!system.is_empty()).then_some(packs::SYSTEM_PROMPT_PATH),
+            plugin_dirs: packs.iter().map(Pack::container_dir).collect(),
+            skills: packs.iter().any(Pack::has_skills),
+            binds,
+        }))
     }
 
     /// The stage's prompt, with the context gathered so far: the plan, the
@@ -1121,7 +1212,14 @@ impl Engine {
         }
     }
 
-    fn agent_spec(&self, run: &Run, attempt: i64, argv: Vec<String>, mode: AgentMode) -> Spec {
+    fn agent_spec(
+        &self,
+        run: &Run,
+        attempt: i64,
+        argv: Vec<String>,
+        mode: AgentMode,
+        extra: Vec<Bind>,
+    ) -> Spec {
         let mut env = vec![
             ("HOME".to_owned(), EnvValue::Plain(sandbox::HOME.to_owned())),
             (
@@ -1154,7 +1252,10 @@ impl Engine {
                     target: "/work/.git".to_owned(),
                     read_only: true,
                 },
-            ],
+            ]
+            .into_iter()
+            .chain(extra)
+            .collect(),
             network,
             labels: self.labels(run.id, attempt),
             user: self.user.clone(),

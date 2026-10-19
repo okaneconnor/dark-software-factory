@@ -57,12 +57,18 @@ pub struct Config {
     pub protected: ProtectedPaths,
     /// The operator's own protected paths, as written.
     pub protect_extra: Vec<String>,
+    /// Where standards packs live, one directory per pack, if any repo
+    /// uses them.
+    pub packs_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoConfig {
     pub slug: RepoSlug,
     pub approval: ApprovalPolicy,
+    /// Standards packs for this repo's agents: directory names under
+    /// `packs_dir`.
+    pub packs: Vec<String>,
 }
 
 /// `owner/name` on GitHub.
@@ -157,6 +163,14 @@ struct RawConfig {
     images: RawImages,
     #[serde(default)]
     protect: RawProtect,
+    #[serde(default)]
+    packs: RawPacks,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPacks {
+    dir: Option<PathBuf>,
 }
 
 #[derive(Deserialize)]
@@ -179,6 +193,8 @@ struct RawRepo {
     name: String,
     #[serde(default)]
     approval: ApprovalPolicy,
+    #[serde(default)]
+    packs: Vec<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -355,8 +371,28 @@ impl RawConfig {
         if self.repos.is_empty() {
             check.fail("repos", "configure at least one repo");
         }
+        let packs_dir = self.packs.dir;
+        if packs_dir.as_ref().is_some_and(|dir| !dir.is_absolute()) {
+            check.fail("packs.dir", "must be an absolute path");
+        }
         let mut repos: Vec<RepoConfig> = Vec::new();
         for raw in self.repos {
+            for pack in &raw.packs {
+                if !is_pack_name(pack) {
+                    check.fail(
+                        "repos.packs",
+                        format!(
+                            "`{pack}` is not a pack name: lowercase letters, digits and hyphens"
+                        ),
+                    );
+                }
+            }
+            if !raw.packs.is_empty() && packs_dir.is_none() {
+                check.fail(
+                    "repos.packs",
+                    format!("{} names packs, so set packs.dir", raw.name),
+                );
+            }
             match raw.name.parse::<RepoSlug>() {
                 Ok(slug) if repos.iter().any(|repo| repo.slug.matches(&slug)) => {
                     check.fail("repos", format!("`{slug}` is listed twice"));
@@ -364,6 +400,7 @@ impl RawConfig {
                 Ok(slug) => repos.push(RepoConfig {
                     slug,
                     approval: raw.approval,
+                    packs: raw.packs,
                 }),
                 Err(message) => check.fail("repos", message),
             }
@@ -450,8 +487,20 @@ impl RawConfig {
             dsf_image,
             protected,
             protect_extra: self.protect.extra,
+            packs_dir,
         })
     }
+}
+
+/// A pack's directory name: lowercase letters, digits and hyphens, so it
+/// is safe as a path segment and a plugin name.
+fn is_pack_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && !name.starts_with('-')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 /// GitHub logins: 1–39 ASCII letters, digits or single hyphens, not
@@ -578,6 +627,52 @@ mod tests {
                 .unwrap()
                 .workers,
             2
+        );
+    }
+
+    #[test]
+    fn packs_are_named_per_repo_from_one_directory() {
+        let with_packs = |dir: &str, packs: &str| {
+            format!(
+                r#"
+                timezone = "Europe/London"
+                {dir}
+                [github]
+                allowed_users = ["octocat"]
+                [[repos]]
+                name = "octocat/hello-world"
+                packs = {packs}
+                [images]
+                worker = "w"
+                "#
+            )
+        };
+        let config = Config::parse(&with_packs(
+            "[packs]\ndir = \"/etc/dsf/packs\"",
+            r#"["terraform-azure"]"#,
+        ))
+        .unwrap();
+        assert_eq!(config.packs_dir, Some(PathBuf::from("/etc/dsf/packs")));
+        assert_eq!(config.repos[0].packs, ["terraform-azure"]);
+
+        assert_eq!(
+            fields(&with_packs("", r#"["terraform-azure"]"#)),
+            ["repos.packs"]
+        );
+        assert_eq!(
+            fields(&with_packs(
+                "[packs]\ndir = \"/etc/dsf/packs\"",
+                r#"["../up"]"#
+            )),
+            ["repos.packs"]
+        );
+        assert_eq!(
+            fields(&with_packs("[packs]\ndir = \"packs\"", "[]")),
+            ["packs.dir"]
+        );
+        assert_eq!(
+            Config::parse(MINIMAL).unwrap().repos[0].packs,
+            Vec::<String>::new()
         );
     }
 

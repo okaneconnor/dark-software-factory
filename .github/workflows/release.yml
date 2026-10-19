@@ -52,6 +52,7 @@ jobs:
           name="dsf-$VERSION-$TARGET"
           mkdir -p "dist/$name"
           cp "target/$TARGET/release/dsf" LICENSE "dist/$name/"
+          cp -R examples/packs "dist/$name/packs"
           file "dist/$name/dsf" | tee /dev/stderr | grep -Eq 'statically linked|static-pie linked'
           "dist/$name/dsf" --version
           tar -C dist -czf "dist/$name.tar.gz" "$name"

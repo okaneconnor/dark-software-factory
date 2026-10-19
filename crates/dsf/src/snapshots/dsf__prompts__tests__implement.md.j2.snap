@@ -30,6 +30,7 @@ Change `a - b` to `a + b` in calc.py.
 Rules:
 
 - Make the change the plan describes, adding or updating tests where the repository has them.
+- Follow the repository's instructions and any standards in your system prompt. If a standards pack skill covers this work, load it before you write code.
 - Don't modify .factory/, .github/, .claude/, .mcp.json. Any change there stops the run.
 - Don't commit, push or change git configuration. The git directory is read-only; the factory records your changes itself.
 - Run `.factory/verify.sh` if you can and fix what it reports. If it needs network access you don't have, say so and stop there.
