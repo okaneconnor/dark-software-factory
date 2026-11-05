@@ -91,13 +91,18 @@ impl Masker {
         self.find_in(text, |_| true)
     }
 
-    /// Where the lines a unified diff adds contain a secret. Used on the
-    /// diff before a push; any finding stops the push. Removed and
-    /// unchanged lines are already in the repository, so they are skipped:
-    /// otherwise a token-shaped test fixture would block every change made
-    /// near it.
+    /// Where what a unified diff adds contains a secret: its added lines,
+    /// and its file headers, which hold the names of added and renamed
+    /// files (a pure rename or an empty new file has no `+` line at all).
+    /// Used on the diff before a push; any finding stops the push.
+    /// Unchanged and removed lines, and hunk headers, whose context comes
+    /// from the old file, are already in the repository, so they are
+    /// skipped: otherwise a token-shaped test fixture would block every
+    /// change made near it.
     pub fn find_added(&self, diff: &str) -> Vec<Finding> {
-        self.find_in(diff, |line| line.starts_with('+'))
+        self.find_in(diff, |line| {
+            !(line.starts_with([' ', '-']) || line.starts_with("@@"))
+        })
     }
 
     fn find_in(&self, text: &str, scan: impl Fn(&str) -> bool) -> Vec<Finding> {
@@ -268,6 +273,25 @@ mod tests {
             }]
         );
         assert_eq!(masker.find(&diff).len(), 3);
+    }
+
+    /// As `git diff` prints them: an empty file named like a token, and a
+    /// pure rename to a known secret. Neither has a `+` line.
+    #[test]
+    fn in_a_diff_added_file_names_count() {
+        let masker = masker_with(&["s3cr3t-value-123"]);
+        let token = format!("ghs_{}", "x".repeat(36));
+        let diff = format!(
+            "diff --git a/{token} b/{token}\nnew file mode 100644\nindex 0000000..e69de29\n\
+             diff --git a/README.md b/s3cr3t-value-123.md\nsimilarity index 100%\n\
+             rename from README.md\nrename to s3cr3t-value-123.md\n"
+        );
+        let lines: Vec<usize> = masker
+            .find_added(&diff)
+            .iter()
+            .map(|finding| finding.line)
+            .collect();
+        assert_eq!(lines, [1, 1, 4, 7]);
     }
 
     #[test]

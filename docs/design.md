@@ -212,7 +212,7 @@ The controls below are what make dsf safe to leave running unattended. [`CLAUDE.
 6. **Secret hygiene.**
    - Tokens are held in `secrecy` types.
    - A masker redacts every known secret value, and the encoded forms dsf sends such as the basic-auth header, from everything that leaves the host: logs, board pages, GitHub comments and PR bodies, digests. It also redacts anything shaped like an Anthropic or GitHub token, which catches secrets the agent found rather than ones dsf holds.
-   - Before any push, the lines the change adds are scanned for the secret values dsf holds and for token shapes. The pushed commit is exactly that change, so the scan covers everything that leaves the host. Removed and unchanged lines are skipped, since they are already in the repository.
+   - Before any push, what the change adds is scanned for the secret values dsf holds and for token shapes: the lines it adds, and the diff's file headers, which carry the names of added and renamed files (a pure rename or an empty file adds no line). The pushed commit is exactly that change, so the scan covers everything that leaves the host. Removed and unchanged lines, and hunk headers, are skipped, since they are already in the repository.
 7. **Trusted input only.**
    - dsf acts only on configured repos, and only on issues whose author **and** the user who applied `factory:ready` are on the operator allowlist, verified through the issue events API. Logins are compared case-insensitively, as GitHub does. This matters because repos, including this one, may be public.
    - The labeller is the latest *person* to add `factory:ready`. dsf's own bot re-adds the label when a usage limit requeues an issue; that must neither count as trust nor hide who gave it.

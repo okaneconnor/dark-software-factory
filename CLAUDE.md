@@ -46,7 +46,7 @@ These are the reasons this project exists rather than using an off-the-shelf too
 3. The host never follows symlinks in a run's worktree. Agent output is read from the stream-json result or from git objects.
 4. Changes to protected paths (`.factory/`, `.github/`, `.claude/`, `.mcp.json`) block the run. Verify always uses the `.factory/` snapshot taken at the run's base commit, mounted read-only.
 5. Containers are non-root, with `cap-drop ALL`, `no-new-privileges`, a read-only root filesystem, resource limits and an allowlisted environment, and never get the Docker socket. Agent egress goes only through the allowlisting proxy.
-6. Everything that leaves the host (logs, the board, GitHub comments and PRs, the digest) passes through the secret masker. A branch is pushed as one squashed commit, whose added lines are scanned for secrets first.
+6. Everything that leaves the host (logs, the board, GitHub comments and PRs, the digest) passes through the secret masker. A branch is pushed as one squashed commit, whose added lines and file names are scanned for secrets first.
 7. The factory acts only on issues in configured repos that were authored **and** labelled `factory:ready` by allowlisted users.
 
 ## Don't
