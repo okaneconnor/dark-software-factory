@@ -2,7 +2,7 @@
 
 `dsf` turns GitHub issues you have approved into verified **draft** pull requests, unattended, overnight. It drives [Claude Code](https://claude.com/claude-code) in headless mode inside locked-down containers that never hold a GitHub token, and it treats a script in the target repo as the only definition of "done".
 
-> **Status: pre-alpha, under construction.** `dsf run owner/repo#N` takes an approved GitHub issue end to end, acting as a GitHub App: it plans, implements, verifies, reviews, then opens a draft pull request and updates the issue. `dsf tick`, which a systemd timer runs every few minutes, does this unattended: inside the night window it works through every configured repo's queue, backs off after usage limits, stops at 80% of the weekly Claude allowance so the rest is yours, carries on after crashes and expires plans no one approved; `dsf status` shows where everything stands, a 07:00 digest sums up the night in Slack or Teams, and `dsf doctor` checks a host before it's trusted with a queue. Agents follow the repository's `CLAUDE.md` and `AGENTS.md` and the operator's standards packs, which are ordinary Claude Code plugins. Next is packaging and the first deployment. The design is in [`docs/design.md`](docs/design.md) and progress is tracked in the [roadmap](#roadmap).
+> **Status: pre-alpha, under construction.** `dsf run owner/repo#N` takes an approved GitHub issue end to end, acting as a GitHub App: it plans, implements, verifies, reviews, then opens a draft pull request and updates the issue. `dsf tick`, which a systemd timer runs every few minutes, does this unattended: inside the night window it works through every configured repo's queue, backs off after usage limits, stops at 80% of the weekly Claude allowance so the rest is yours, carries on after crashes and expires plans no one approved; `dsf status` shows where everything stands, a 07:00 digest sums up the night in Slack or Teams, and `dsf doctor` checks a host before it's trusted with a queue. Agents follow the repository's `CLAUDE.md` and `AGENTS.md` and the operator's standards packs, which are ordinary Claude Code plugins. Releases publish a static binary and the images, and dsf has run unattended overnight on its first deployment. The design is in [`docs/design.md`](docs/design.md) and progress is tracked in the [roadmap](#roadmap).
 
 ## How it works
 
@@ -54,8 +54,8 @@ Each target repo can tune this pipeline in `.factory/workflow.toml`, within limi
 | P2 | Local engine: host git, sandbox, agent adapter, verify loop, store | Done |
 | P3 | GitHub: claiming, labels, publishing draft PRs | Done |
 | P4 | Unattended running: `dsf tick` on a timer, night window, backoff, weekly usage cap, crash recovery, digest, doctor | Done |
-| P5 | Packaging: a tag publishes a static binary and the dsf and worker images | **In progress** |
-| P6 | First deployment and dogfooding | Planned |
+| P5 | Packaging: a tag publishes a static binary and the dsf and worker images | Done |
+| P6 | First deployment: unattended overnight runs on a homelab VM, Slack digest, standards packs | Done |
 | P7 | Read-only web board: a kanban of ready, running, awaiting approval, review and blocked | Planned |
 
 ## Development

@@ -26,6 +26,9 @@ pub const MAX_WORKERS: usize = 2;
 /// leaving the rest for the operator's own work.
 pub const DEFAULT_WEEKLY_USAGE_CAP: u8 = 80;
 
+/// Free space below this on the state directory's disk stops new work.
+pub const DEFAULT_MIN_FREE_DISK_GB: u32 = 5;
+
 /// Hosts every agent container needs, whatever the operator adds.
 pub const BUILTIN_EGRESS: &[&str] = &["api.anthropic.com"];
 
@@ -42,6 +45,12 @@ pub struct Config {
     /// until it resets. 100 leaves it to the real limit.
     pub weekly_usage_cap: u8,
     pub state_dir: PathBuf,
+    /// No run starts or continues while the state directory's disk has less
+    /// free space than this.
+    pub min_free_disk_gb: u32,
+    /// How long a finished run's files stay on disk. Its record in the
+    /// store stays for good.
+    pub run_retention: Duration,
     pub allowlist: Allowlist,
     /// The GitHub App dsf acts as. Only `--local` runs work without one.
     pub github_app_id: Option<u64>,
@@ -152,6 +161,8 @@ struct RawConfig {
     approval_expiry: Option<String>,
     weekly_usage_cap: Option<u8>,
     state_dir: Option<PathBuf>,
+    min_free_disk_gb: Option<u32>,
+    run_retention: Option<String>,
     window: Option<RawWindow>,
     github: RawGithub,
     #[serde(default)]
@@ -337,6 +348,18 @@ impl RawConfig {
         if !state_dir.is_absolute() {
             check.fail("state_dir", "must be an absolute path");
         }
+        let min_free_disk_gb = check.number(
+            "min_free_disk_gb",
+            self.min_free_disk_gb,
+            DEFAULT_MIN_FREE_DISK_GB,
+            (1, 10_000),
+        );
+        let run_retention = check.duration(
+            "run_retention",
+            self.run_retention.as_deref(),
+            14 * DAY,
+            (DAY, 365 * DAY),
+        );
 
         let window = match &self.window {
             Some(raw) => Window::new(
@@ -478,6 +501,8 @@ impl RawConfig {
             approval_expiry,
             weekly_usage_cap,
             state_dir,
+            min_free_disk_gb,
+            run_retention,
             allowlist,
             github_app_id: self.github.app_id,
             repos,
@@ -588,6 +613,8 @@ mod tests {
         assert_eq!(config.approval_expiry, 3 * DAY);
         assert_eq!(config.weekly_usage_cap, 80);
         assert_eq!(config.state_dir, PathBuf::from("/var/lib/dsf"));
+        assert_eq!(config.min_free_disk_gb, 5);
+        assert_eq!(config.run_retention, 14 * DAY);
         assert_eq!(config.caps, Caps::default());
         assert_eq!(config.egress, ["api.anthropic.com"]);
         assert_eq!(config.dsf_image, None);
@@ -688,6 +715,22 @@ mod tests {
         );
         let config = Config::parse(&format!("weekly_usage_cap = 100\n{MINIMAL}")).unwrap();
         assert_eq!(config.weekly_usage_cap, 100);
+    }
+
+    #[test]
+    fn disk_settings_are_bounded() {
+        assert_eq!(
+            fields(&format!(
+                "min_free_disk_gb = 0\nrun_retention = \"1h\"\n{MINIMAL}"
+            )),
+            ["min_free_disk_gb", "run_retention"]
+        );
+        let config = Config::parse(&format!(
+            "min_free_disk_gb = 20\nrun_retention = \"30d\"\n{MINIMAL}"
+        ))
+        .unwrap();
+        assert_eq!(config.min_free_disk_gb, 20);
+        assert_eq!(config.run_retention, 30 * DAY);
     }
 
     #[test]

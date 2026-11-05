@@ -128,6 +128,23 @@ pub fn webhook_file(path: &Path) -> Check {
     }
 }
 
+/// The config file parsed: a summary of what it sets up.
+pub fn config(file: &Path, config: &Config) -> Check {
+    let repos = config.repos.len();
+    let workers = config.workers;
+    Check::new(
+        Level::Ok,
+        "config",
+        format!(
+            "{}: {repos} {}, {workers} {}, weekly usage cap {}%",
+            file.display(),
+            if repos == 1 { "repo" } else { "repos" },
+            if workers == 1 { "worker" } else { "workers" },
+            config.weekly_usage_cap,
+        ),
+    )
+}
+
 /// Where runs live: there, writable, and its database usable.
 pub fn state_dir(dir: &Path) -> Check {
     let subject = "state directory";
@@ -165,6 +182,37 @@ pub fn state_dir(dir: &Path) -> Check {
         );
     }
     Check::new(Level::Ok, subject, format!("{shown}, database ready"))
+}
+
+/// Free space where runs live. Below `min_gb`, ticks hold work back; below
+/// twice that, it's worth knowing before a night's runs fill it.
+pub fn disk(dir: &Path, min_gb: u32) -> Check {
+    let subject = "disk space";
+    match crate::rundir::free_space(dir) {
+        Ok(free) => disk_check(free, min_gb),
+        Err(error) => Check::new(Level::Fail, subject, format!("{error:#}")),
+    }
+}
+
+fn disk_check(free: u64, min_gb: u32) -> Check {
+    let subject = "disk space";
+    let min = u64::from(min_gb) * 1_000_000_000;
+    let shown = crate::rundir::size_text(free);
+    if free < min {
+        Check::new(
+            Level::Fail,
+            subject,
+            format!("{shown} free, below min_free_disk_gb ({min_gb} GB), so no run will start"),
+        )
+    } else if free < min.saturating_mul(2) {
+        Check::new(
+            Level::Warn,
+            subject,
+            format!("{shown} free, close to min_free_disk_gb ({min_gb} GB)"),
+        )
+    } else {
+        Check::new(Level::Ok, subject, format!("{shown} free"))
+    }
 }
 
 /// Each repo's standards packs: there, and usable as Claude Code plugins.
@@ -383,6 +431,17 @@ mod tests {
         assert!(dir.path().join("dsf.sqlite").is_file());
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(state_dir(dir.path()).level, Level::Warn);
+    }
+
+    #[test]
+    fn low_disk_fails_and_nearly_low_warns() {
+        assert_eq!(disk_check(4_000_000_000, 5).level, Level::Fail);
+        assert_eq!(disk_check(9_000_000_000, 5).level, Level::Warn);
+        let fine = disk_check(52_000_000_000, 5);
+        assert_eq!(fine.level, Level::Ok);
+        assert_eq!(fine.detail, "52 GB free");
+        let dir = tempfile::tempdir().unwrap();
+        assert_ne!(disk(dir.path(), 1).detail, "");
     }
 
     #[test]

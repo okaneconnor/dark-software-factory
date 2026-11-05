@@ -452,6 +452,7 @@ dependencies = [
  "ring",
  "rusqlite",
  "rusqlite_migration",
+ "rustix",
  "rustls",
  "secrecy",
  "serde",

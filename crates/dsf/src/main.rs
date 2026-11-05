@@ -403,6 +403,17 @@ fn report_end(end: &RunEnd) -> ExitCode {
             println!("run {run_id}: {reason}");
             ExitCode::from(EXIT_PUBLISH_FAILED)
         }
+        // Resumable like any suspended run, with `dsf run --resume`.
+        RunEnd::Faulted {
+            run_id,
+            detail,
+            retry_after,
+        } => {
+            println!(
+                "run {run_id}: suspended after a fault, to retry after {retry_after}: {detail}"
+            );
+            ExitCode::from(EXIT_SUSPENDED)
+        }
     }
 }
 
@@ -573,10 +584,17 @@ fn tick(args: &WorkerArgs) -> Result<()> {
     for note in &record.notes {
         println!("{note}");
     }
-    if record.notes.is_empty() {
+    for problem in &record.problems {
+        println!("problem: {problem}");
+    }
+    if record.notes.is_empty() && record.problems.is_empty() {
         println!("nothing to do");
     }
-    Ok(())
+    // Non-zero, so systemd marks the unit failed and someone looks.
+    match record.problems.len() {
+        0 => Ok(()),
+        n => bail!("{n} problem(s) this tick; see above"),
+    }
 }
 
 fn status(args: &StateArgs) -> Result<()> {
@@ -644,28 +662,15 @@ fn doctor(args: &WorkerArgs) -> Result<()> {
             bail!("the config is unusable");
         }
     };
-    let repos = config.repos.len();
-    checks.push(Check::new(
-        Level::Ok,
-        "config",
-        format!(
-            "{}: {repos} {}, {} {}, weekly usage cap {}%",
-            config_file.display(),
-            if repos == 1 { "repo" } else { "repos" },
-            config.workers,
-            if config.workers == 1 {
-                "worker"
-            } else {
-                "workers"
-            },
-            config.weekly_usage_cap,
-        ),
-    ));
+    checks.push(doctor::config(&config_file, &config));
     let state = args
         .state_dir
         .clone()
         .unwrap_or_else(|| config.state_dir.clone());
     checks.push(doctor::state_dir(&state));
+    if state.is_dir() {
+        checks.push(doctor::disk(&state, config.min_free_disk_gb));
+    }
     checks.extend(doctor::packs(&config));
 
     let token = match &args.token_file {

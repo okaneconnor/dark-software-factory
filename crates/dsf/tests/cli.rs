@@ -185,6 +185,8 @@ fn run_takes_an_issue_as_owner_repo_number() {
 }
 
 /// A config for octo/calc and a GitHub App key, as an operator has them.
+/// The worker is the fake agent's image, the one image the Docker tests
+/// build, so a tick's host check passes wherever they run.
 fn github_setup(dir: &std::path::Path) -> (PathBuf, PathBuf) {
     let config = dir.join("config.toml");
     std::fs::write(
@@ -199,9 +201,10 @@ fn github_setup(dir: &std::path::Path) -> (PathBuf, PathBuf) {
             [[repos]]
             name = "octo/calc"
             [images]
-            worker = "dsf-worker:dev"
+            worker = "{}"
             "#,
-            dir.join("state").display()
+            dir.join("state").display(),
+            support::FAKE_IMAGE
         ),
     )
     .unwrap();

@@ -286,7 +286,29 @@ impl Factory {
     /// it can; without, it only cancels runs whose issue was closed and
     /// expires plans no one approved in time. A run whose issue a human has
     /// moved elsewhere is left for them.
+    ///
+    /// When carrying on fails outside a stage, e.g. because its issue can no
+    /// longer be read, the error is returned for the scheduler to back off
+    /// on, until the run has faulted
+    /// [`MAX_RUN_FAULTS`](crate::engine::MAX_RUN_FAULTS) times in a row:
+    /// then it is blocked, so it can't hold the queue up night after night.
     pub async fn continue_run(&self, run: &store::Run, may_resume: bool) -> Result<Outcome> {
+        match self.look_in_on(run, may_resume).await {
+            Err(error) if may_resume => {
+                let detail = format!("dsf couldn't carry on with the run: {error:#}");
+                let Some(end) = self.engine.fault(run.id, &detail)? else {
+                    return Err(error);
+                };
+                if let Ok(repo) = run.repo.parse::<RepoSlug>() {
+                    self.report(&repo, run.issue, &end).await;
+                }
+                Ok(Outcome::Ended(end))
+            }
+            outcome => outcome,
+        }
+    }
+
+    async fn look_in_on(&self, run: &store::Run, may_resume: bool) -> Result<Outcome> {
         let repo = match run.repo.parse::<RepoSlug>() {
             Ok(slug) => match self.config.repo(&slug) {
                 Some(settings) => settings.slug.clone(),
@@ -445,12 +467,7 @@ impl Factory {
     /// is recorded rather than returned: the run's own state is saved, and
     /// the labels can be put right later.
     async fn report(&self, repo: &RepoSlug, number: u64, end: &RunEnd) {
-        let run_id = match end {
-            RunEnd::Published { run_id, .. }
-            | RunEnd::Blocked { run_id, .. }
-            | RunEnd::Suspended { run_id, .. }
-            | RunEnd::PublishFailed { run_id, .. } => *run_id,
-        };
+        let run_id = end.run_id();
         if let Err(error) = self.try_report(repo, number, end).await {
             self.engine.note(
                 run_id,
@@ -505,6 +522,10 @@ impl Factory {
                 }
                 (Lifecycle::Ready, comment)
             }
+            // The issue stays `factory:running`: the run carries on by
+            // itself once the host is fit again, and the fault is dsf's to
+            // report, in the tick's problems and the digest, not the issue's.
+            RunEnd::Faulted { .. } => return Ok(()),
             RunEnd::Suspended {
                 run_id,
                 reason: SuspendReason::Interrupted,
