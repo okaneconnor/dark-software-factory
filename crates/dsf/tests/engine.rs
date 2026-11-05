@@ -259,6 +259,46 @@ async fn a_fault_during_setup_sets_the_run_up_again() {
     assert!(matches!(end, RunEnd::Published { .. }), "{end:?}");
 }
 
+/// A setup that fails every time, as it would for an empty repository, is
+/// the run's problem rather than the host's: it is blocked on the third
+/// try instead of being retried for ever.
+#[tokio::test]
+async fn a_setup_that_always_fails_is_blocked_on_the_third_fault() {
+    if !enabled() {
+        return;
+    }
+    let world = World::new("setupfaults");
+    let readable = std::fs::metadata(&world.origin).unwrap().permissions();
+    std::fs::set_permissions(&world.origin, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let engine = world.engine("fake");
+    let first = engine.start(&world.issue("fake-implement: fix-calc")).await;
+    let second = match &first {
+        Ok(RunEnd::Faulted { run_id, .. }) => {
+            Some(engine.resume(*run_id, ResumeOptions::default()).await)
+        }
+        _ => None,
+    };
+    let third = match &second {
+        Some(Ok(RunEnd::Faulted { run_id, .. })) => {
+            Some(engine.resume(*run_id, ResumeOptions::default()).await)
+        }
+        _ => None,
+    };
+    std::fs::set_permissions(&world.origin, readable).unwrap();
+
+    assert!(matches!(first, Ok(RunEnd::Faulted { .. })), "{first:?}");
+    assert!(
+        matches!(second, Some(Ok(RunEnd::Faulted { .. }))),
+        "{second:?}"
+    );
+    let reason = blocked_reason(third.unwrap().unwrap());
+    assert!(reason.starts_with("setting up the run failed"), "{reason}");
+    assert!(
+        reason.ends_with("(3 times in a row, so dsf stopped retrying)"),
+        "{reason}"
+    );
+}
+
 /// A run whose files are gone can't continue, so it is blocked rather than
 /// retried every tick.
 #[tokio::test]

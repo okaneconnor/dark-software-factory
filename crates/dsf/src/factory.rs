@@ -286,7 +286,29 @@ impl Factory {
     /// it can; without, it only cancels runs whose issue was closed and
     /// expires plans no one approved in time. A run whose issue a human has
     /// moved elsewhere is left for them.
+    ///
+    /// When carrying on fails outside a stage, e.g. because its issue can no
+    /// longer be read, the error is returned for the scheduler to back off
+    /// on, until the run has faulted
+    /// [`MAX_RUN_FAULTS`](crate::engine::MAX_RUN_FAULTS) times in a row:
+    /// then it is blocked, so it can't hold the queue up night after night.
     pub async fn continue_run(&self, run: &store::Run, may_resume: bool) -> Result<Outcome> {
+        match self.look_in_on(run, may_resume).await {
+            Err(error) if may_resume => {
+                let detail = format!("dsf couldn't carry on with the run: {error:#}");
+                let Some(end) = self.engine.fault(run.id, &detail)? else {
+                    return Err(error);
+                };
+                if let Ok(repo) = run.repo.parse::<RepoSlug>() {
+                    self.report(&repo, run.issue, &end).await;
+                }
+                Ok(Outcome::Ended(end))
+            }
+            outcome => outcome,
+        }
+    }
+
+    async fn look_in_on(&self, run: &store::Run, may_resume: bool) -> Result<Outcome> {
         let repo = match run.repo.parse::<RepoSlug>() {
             Ok(slug) => match self.config.repo(&slug) {
                 Some(settings) => settings.slug.clone(),

@@ -84,6 +84,33 @@ fn seed_run(store: &mut Store, issue: u64) -> i64 {
         .unwrap()
 }
 
+/// A run whose plan, comment #99 posted at 2026-10-18T10:00:00Z, is
+/// waiting for approval.
+fn seed_awaiting_approval(store: &mut Store, issue: u64) -> i64 {
+    let run = seed_run(store, issue);
+    let attempt = store
+        .start_attempt(run, "approve", 1, None, at("2026-10-18T09:59:00Z"))
+        .unwrap();
+    store
+        .finish_attempt(
+            run,
+            attempt,
+            &AttemptEnd::default(),
+            &Progress::default(),
+            None,
+            Advance::Suspend {
+                reason: SuspendReason::Approval,
+                resume_after: None,
+            },
+            at("2026-10-18T09:59:00Z"),
+        )
+        .unwrap();
+    store
+        .set_approval_comment(run, 99, at("2026-10-18T10:00:00Z"))
+        .unwrap();
+    run
+}
+
 #[tokio::test]
 async fn outside_the_window_the_queue_is_seen_but_nothing_is_claimed() {
     let world = World::new("window");
@@ -323,30 +350,8 @@ async fn a_plan_no_one_approves_expires_even_outside_the_window() {
     .await;
     fake.listing("factory:ready", json!([])).await;
     fake.listing("factory:running", json!([])).await;
-    // The plan comment, #99, was posted at 2026-10-18T10:00:00Z.
     fake.writable().await;
-    let mut store = world.store();
-    let run = seed_run(&mut store, 1);
-    let attempt = store
-        .start_attempt(run, "approve", 1, None, at("2026-10-18T09:59:00Z"))
-        .unwrap();
-    store
-        .finish_attempt(
-            run,
-            attempt,
-            &AttemptEnd::default(),
-            &Progress::default(),
-            None,
-            Advance::Suspend {
-                reason: SuspendReason::Approval,
-                resume_after: None,
-            },
-            at("2026-10-18T09:59:00Z"),
-        )
-        .unwrap();
-    store
-        .set_approval_comment(run, 99, at("2026-10-18T10:00:00Z"))
-        .unwrap();
+    let run = seed_awaiting_approval(&mut world.store(), 1);
 
     // Three days less a minute: still waiting, and the window is shut.
     let record = scheduler(&world, &fake, "", "fake", at("2026-10-21T09:59:00Z"))
@@ -379,6 +384,59 @@ async fn a_plan_no_one_approves_expires_even_outside_the_window() {
             "POST /repos/octo/calc/issues/1/labels",
             "POST /repos/octo/calc/issues/1/comments",
         ]
+    );
+}
+
+/// A paused run whose issue can no longer be read, here because the fake
+/// has no issue #1: by day that is a problem but holds nothing back; by
+/// night each try is a fault, and the third blocks the run, so it can't
+/// keep claiming backed off for good.
+#[tokio::test]
+async fn a_run_whose_issue_cant_be_read_is_blocked_after_three_faults() {
+    let world = World::new("unreadable");
+    let fake = Fake::start().await;
+    fake.listing("factory:ready", json!([])).await;
+    fake.listing("factory:running", json!([])).await;
+    fake.writable().await;
+    let run = seed_awaiting_approval(&mut world.store(), 1);
+
+    for minute in ["11:00", "11:05", "11:10"] {
+        let record = scheduler(
+            &world,
+            &fake,
+            "",
+            "fake",
+            at(&format!("2026-10-19T{minute}:00Z")),
+        )
+        .tick()
+        .await
+        .unwrap();
+        assert_eq!(record.problems.len(), 1, "{:?}", record.problems);
+        assert!(
+            record.problems[0].starts_with("octo/calc#1: "),
+            "{:?}",
+            record.problems
+        );
+    }
+    assert_eq!(world.store().kv_get(BACKOFF_UNTIL).unwrap(), None);
+    assert_eq!(world.store().run(run).unwrap().status, RunStatus::Suspended);
+
+    // Each fault backs claiming off for longer: 30 minutes, then an hour.
+    for (time, status) in [
+        ("2026-10-19T22:30:00Z", RunStatus::Suspended),
+        ("2026-10-19T23:01:00Z", RunStatus::Suspended),
+        ("2026-10-20T00:02:00Z", RunStatus::Blocked),
+    ] {
+        scheduler(&world, &fake, "", "fake", at(time))
+            .tick()
+            .await
+            .unwrap();
+        assert_eq!(world.store().run(run).unwrap().status, status, "at {time}");
+    }
+    let reason = world.store().run(run).unwrap().end_reason.unwrap();
+    assert!(
+        reason.ends_with("(3 times in a row, so dsf stopped retrying)"),
+        "{reason}"
     );
 }
 
@@ -431,6 +489,48 @@ async fn finished_runs_files_go_once_they_are_older_than_the_retention() {
         record.notes
     );
     assert_eq!(RunDir::list(&world.state).unwrap(), [recent, suspended]);
+}
+
+/// Files that can't be pruned are a problem, but they don't stop the host
+/// running work: only the host checks decide that.
+#[tokio::test]
+async fn a_run_that_cant_be_pruned_doesnt_make_the_host_unfit() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let world = World::new("stuck");
+    let fake = Fake::start().await;
+    fake.listing("factory:ready", json!([])).await;
+    fake.listing("factory:running", json!([])).await;
+    let mut store = world.store();
+    let old = seed_run(&mut store, 1);
+    store
+        .end_run(
+            old,
+            RunStatus::Published,
+            "published",
+            at("2026-10-01T00:00:00Z"),
+        )
+        .unwrap();
+    RunDir::create(&world.state, old).unwrap();
+    let runs = world.state.join("runs");
+    let writable = std::fs::metadata(&runs).unwrap().permissions();
+    std::fs::set_permissions(&runs, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+    let record = scheduler(&world, &fake, "", "fake", at("2026-10-19T11:00:00Z"))
+        .tick()
+        .await;
+    std::fs::set_permissions(&runs, writable).unwrap();
+    let record = record.unwrap();
+    assert_eq!(record.problems.len(), 1, "{:?}", record.problems);
+    assert!(
+        record.problems[0].starts_with("removing old runs' files"),
+        "{:?}",
+        record.problems
+    );
+    assert_eq!(
+        record.notes,
+        ["outside the window, which opens at Mon 19 Oct 23:00"]
+    );
 }
 
 /// When the host can't run work, nothing is claimed or resumed, and why is

@@ -56,6 +56,12 @@ const LIMIT_HITS: &str = "usage_limit_hits";
 /// the wait before dsf tries again.
 const FAULTS: &str = "faults_in_a_row";
 
+/// Faults one run may have with no stage of it finishing between them
+/// before it is blocked. A fault that comes back every time, such as an
+/// empty repository or a deleted issue, is the run's, not the host's, and
+/// retrying it for ever would hold every other issue back.
+pub const MAX_RUN_FAULTS: usize = 3;
+
 /// The time, from the system clock except in tests.
 pub type Clock = Arc<dyn Fn() -> Timestamp + Send + Sync>;
 
@@ -406,9 +412,11 @@ impl Engine {
                 let detail = self
                     .masker
                     .mask(&format!("setting up the run failed: {error:#}"));
+                if let Some(end) = self.fault(run_id, &detail)? {
+                    return Ok(end);
+                }
                 let retry_after = self.fault_backoff()?;
                 self.db()?.suspend_setup(run_id, retry_after, self.now())?;
-                self.event(run_id, "fault", &detail);
                 Ok(RunEnd::Faulted {
                     run_id,
                     detail,
@@ -429,6 +437,27 @@ impl Engine {
             .saturating_add(1);
         db.kv_set(FAULTS, &faults.to_string())?;
         Ok(schedule::backoff(self.now(), faults))
+    }
+
+    /// Records that dsf failed on `run_id` outside its stages, e.g. setting
+    /// it up or picking it up again. Once that is [`MAX_RUN_FAULTS`] faults
+    /// with no stage finishing between them, the run is blocked and its
+    /// end returned; until then the caller suspends it to retry.
+    pub fn fault(&self, run_id: i64, detail: &str) -> Result<Option<RunEnd>> {
+        self.event(run_id, "fault", detail);
+        let faults = self
+            .db()?
+            .events(run_id)?
+            .iter()
+            .rev()
+            .take_while(|(kind, _)| kind != "outcome")
+            .filter(|(kind, _)| kind == "fault")
+            .count();
+        if faults < MAX_RUN_FAULTS {
+            return Ok(None);
+        }
+        let reason = format!("{detail} ({faults} times in a row, so dsf stopped retrying)");
+        self.block(run_id, &reason).map(Some)
     }
 
     /// Ends an unfinished run that will never continue, e.g. because its

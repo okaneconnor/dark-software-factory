@@ -130,12 +130,15 @@ impl Scheduler {
                 .problems
                 .push(format!("removing old runs' files: {error:#}")),
         }
+        // Only what stops the host running work holds work back; a run
+        // directory that couldn't be pruned is a problem but not that.
+        let mut healthy = true;
         if self.check_host {
             let min_free = u64::from(config.min_free_disk_gb).saturating_mul(1_000_000_000);
-            log.problems
-                .extend(self.factory.engine().preflight(min_free).await);
+            let unfit = self.factory.engine().preflight(min_free).await;
+            healthy = unfit.is_empty();
+            log.problems.extend(unfit);
         }
-        let healthy = log.problems.is_empty();
 
         self.forget_unconfigured(&mut log.notes)?;
 
@@ -184,8 +187,15 @@ impl Scheduler {
                     .iter()
                     .filter(|run| run.suspend_reason == Some(SuspendReason::Approval))
                 {
-                    let outcome = self.factory.continue_run(run, false).await;
-                    self.record(&format!("{}#{}", run.repo, run.issue), outcome, &mut log)?;
+                    let label = format!("{}#{}", run.repo, run.issue);
+                    // Looking in on a plan starts no work, so failing to is
+                    // a problem but no reason to back off: backing off here
+                    // would hold claiming back for as long as one issue
+                    // can't be read, since this runs on every tick.
+                    match self.factory.continue_run(run, false).await {
+                        Err(error) => log.problems.push(format!("{label}: {error:#}")),
+                        outcome => self.record(&label, outcome, &mut log)?,
+                    }
                 }
             }
         }
