@@ -48,6 +48,8 @@ case "$stage:$action" in
     echo x > vendor/lib/file ;;
   *:gitmodules) fix_calc; printf '[submodule "x"]\n\tpath = x\n\turl = https://example.invalid/x\n' > .gitmodules ;;
   *:leak-token) fix_calc; printf 'TOKEN = "ghp_%s"\n' "$(printf 'A%.0s' $(seq 1 36))" > settings.py ;;
+  *:leak-token-only) printf 'TOKEN = "ghp_%s"\n' "$(printf 'A%.0s' $(seq 1 36))" > settings.py ;;
+  *:unleak-fix-calc) rm -f settings.py; fix_calc ;;
   *:env-names)
     fix_calc
     tr '\0' '\n' < /proc/1/environ | cut -d= -f1 | sort > env-names.txt

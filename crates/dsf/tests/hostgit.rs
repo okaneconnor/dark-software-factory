@@ -405,6 +405,45 @@ async fn reset_discards_work_but_keeps_the_mount_point() {
 }
 
 #[tokio::test]
+async fn squash_makes_one_commit_with_the_tips_tree() {
+    let fixture = Fixture::new();
+    let (repo, base) = fixture.clone().await;
+    write(&repo.work_tree().join("leak.txt"), "oops\n");
+    repo.checkpoint("dsf: implement").await.unwrap().unwrap();
+    std::fs::remove_file(repo.work_tree().join("leak.txt")).unwrap();
+    write(
+        &repo.work_tree().join("calc.py"),
+        "def add(a, b):\n    return a + b\n",
+    );
+    let tip = repo.checkpoint("dsf: fix").await.unwrap().unwrap();
+
+    let squashed = repo
+        .squash(&base, &tip, "Fix add (#1)\n\nFrom dsf run 1.")
+        .await
+        .unwrap();
+    let git_dir = repo.git_dir().to_owned();
+    let show = |args: &[&str]| {
+        let mut all = vec!["--git-dir", git_dir.to_str().unwrap()];
+        all.extend(args);
+        git(&fixture.root, &all)
+    };
+    assert_eq!(
+        show(&["rev-list", &format!("{base}..{squashed}")]),
+        squashed.as_str()
+    );
+    assert_eq!(
+        show(&["rev-parse", &format!("{squashed}^{{tree}}")]),
+        show(&["rev-parse", &format!("{tip}^{{tree}}")])
+    );
+    assert_eq!(
+        show(&["log", "-1", "--format=%an <%ae>%n%B", squashed.as_str()]),
+        "dsf <dsf@localhost.invalid>\nFix add (#1)\n\nFrom dsf run 1."
+    );
+    // HEAD and the worktree are left alone.
+    assert_eq!(repo.head().await.unwrap(), tip);
+}
+
+#[tokio::test]
 async fn pushes_only_factory_branches() {
     let fixture = Fixture::new();
     let remote = fixture.root.join("remote.git");

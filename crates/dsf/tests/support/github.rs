@@ -21,6 +21,10 @@ use super::{FAKE_IMAGE, TOKEN, app_key_pem, git};
 
 pub const INSTALLATION_TOKEN: &str = "ghs_installationtokenfortestsonly0123456789";
 pub const PR_URL: &str = "https://github.com/octo/calc/pull/5";
+/// The factory's time in these tests: just after the fake posts its
+/// comments (10:00) and the approvals (10:05), so how long a plan has
+/// waited doesn't depend on the day the tests run.
+pub const NOW: &str = "2026-10-18T10:30:00Z";
 
 pub fn repo() -> RepoSlug {
     "octo/calc".parse().unwrap()
@@ -313,7 +317,8 @@ impl World {
         .unwrap()
         .with_forge(Box::new(GitHubForge::new(github.clone())));
         let git_base = format!("{}/", self.root.join("remotes").display());
-        Factory::new(engine, github, config, &git_base)
+        let now: jiff::Timestamp = NOW.parse().unwrap();
+        Factory::new(engine, github, config, &git_base).with_clock(Arc::new(move || now))
     }
 
     pub fn store(&self) -> Store {
