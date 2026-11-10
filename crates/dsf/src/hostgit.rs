@@ -525,6 +525,23 @@ impl HostGit {
         Ok(())
     }
 
+    /// One commit with `tip`'s tree on top of `base`, which is what gets
+    /// pushed. The run's checkpoints, and anything an agent wrote and a
+    /// later stage removed, never leave the host.
+    pub async fn squash(&self, base: &Sha, tip: &Sha, message: &str) -> Result<Sha> {
+        let mut command = self.command();
+        command.args(AUTHOR).args([
+            "commit-tree",
+            &format!("{tip}^{{tree}}"),
+            "-p",
+            base.as_str(),
+            "-m",
+            message,
+        ]);
+        let out = run(command, LOCAL_TIMEOUT, "commit-tree").await?;
+        Ok(Sha::parse(&String::from_utf8_lossy(&out))?)
+    }
+
     /// Pushes `sha` to `branch` at `url`, replacing whatever was there. Only
     /// `factory/` branches can be pushed.
     pub async fn push(

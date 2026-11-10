@@ -86,12 +86,32 @@ impl Masker {
         mask_token_shapes(&out)
     }
 
-    /// Where `text` contains a secret, line by line. Used on the exact diff
-    /// before a push; any finding stops the push.
+    /// Where `text` contains a secret, line by line.
     pub fn find(&self, text: &str) -> Vec<Finding> {
+        self.find_in(text, |_| true)
+    }
+
+    /// Where what a unified diff adds contains a secret: its added lines,
+    /// and its file headers, which hold the names of added and renamed
+    /// files (a pure rename or an empty new file has no `+` line at all).
+    /// Used on the diff before a push; any finding stops the push.
+    /// Unchanged and removed lines, and hunk headers, whose context comes
+    /// from the old file, are already in the repository, so they are
+    /// skipped: otherwise a token-shaped test fixture would block every
+    /// change made near it.
+    pub fn find_added(&self, diff: &str) -> Vec<Finding> {
+        self.find_in(diff, |line| {
+            !(line.starts_with([' ', '-']) || line.starts_with("@@"))
+        })
+    }
+
+    fn find_in(&self, text: &str, scan: impl Fn(&str) -> bool) -> Vec<Finding> {
         let literals = self.literals.read().unwrap_or_else(PoisonError::into_inner);
         let mut findings = Vec::new();
         for (index, line) in text.lines().enumerate() {
+            if !scan(line) {
+                continue;
+            }
             let line_number = index + 1;
             if literals
                 .iter()
@@ -235,6 +255,43 @@ mod tests {
             ]
         );
         assert_eq!(masker.find("+clean line\n"), Vec::<Finding>::new());
+    }
+
+    #[test]
+    fn in_a_diff_only_added_lines_count() {
+        let masker = masker_with(&["s3cr3t-value-123"]);
+        let token = format!("ghs_{}", "x".repeat(36));
+        let diff = format!(
+            "--- a/settings.py\n+++ b/settings.py\n@@ -1,3 +1,3 @@\n \
+             fixture = \"{token}\"\n-old = \"s3cr3t-value-123\"\n+new = \"{token}\"\n"
+        );
+        assert_eq!(
+            masker.find_added(&diff),
+            [Finding {
+                line: 6,
+                kind: FindingKind::TokenShaped("ghs_")
+            }]
+        );
+        assert_eq!(masker.find(&diff).len(), 3);
+    }
+
+    /// As `git diff` prints them: an empty file named like a token, and a
+    /// pure rename to a known secret. Neither has a `+` line.
+    #[test]
+    fn in_a_diff_added_file_names_count() {
+        let masker = masker_with(&["s3cr3t-value-123"]);
+        let token = format!("ghs_{}", "x".repeat(36));
+        let diff = format!(
+            "diff --git a/{token} b/{token}\nnew file mode 100644\nindex 0000000..e69de29\n\
+             diff --git a/README.md b/s3cr3t-value-123.md\nsimilarity index 100%\n\
+             rename from README.md\nrename to s3cr3t-value-123.md\n"
+        );
+        let lines: Vec<usize> = masker
+            .find_added(&diff)
+            .iter()
+            .map(|finding| finding.line)
+            .collect();
+        assert_eq!(lines, [1, 1, 4, 7]);
     }
 
     #[test]

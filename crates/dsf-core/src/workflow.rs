@@ -241,6 +241,37 @@ impl Workflow {
         self.stages.get(id)
     }
 
+    /// The write stages a run can reach from the start without passing a
+    /// gate: where an agent could change code before anyone approved a
+    /// plan. A run that needs approval refuses a workflow with any.
+    pub fn ungated_writes(&self) -> Vec<StageId> {
+        let mut seen = BTreeSet::new();
+        let mut queue = VecDeque::from([&self.start]);
+        let mut writes = Vec::new();
+        while let Some(id) = queue.pop_front() {
+            if !seen.insert(id) {
+                continue;
+            }
+            let Some(stage) = self.stages.get(id) else {
+                continue;
+            };
+            match stage.kind {
+                StageKind::Gate => continue,
+                StageKind::Agent {
+                    mode: AgentMode::Write,
+                    ..
+                } => writes.push(id.clone()),
+                _ => {}
+            }
+            for target in stage.on.values() {
+                if let Target::Stage(next) = target {
+                    queue.push_back(next);
+                }
+            }
+        }
+        writes
+    }
+
     /// The most stage visits any run of this workflow can make: the sum of
     /// every stage's `max_visits`. This bound is why every run terminates.
     pub fn visit_budget(&self) -> u32 {
@@ -670,6 +701,46 @@ mod tests {
         assert_eq!(workflow.start(), &id("plan"));
         assert_eq!(workflow.stages().len(), 6);
         assert_eq!(workflow.visit_budget(), 13);
+    }
+
+    #[test]
+    fn a_gate_must_come_before_any_write_stage_to_count() {
+        assert_eq!(Workflow::builtin().unwrap().ungated_writes(), []);
+        let skips_the_gate = Workflow::parse(
+            r#"
+            version = 1
+            start = "plan"
+            [stages.plan]
+            kind = "agent"
+            mode = "read"
+            prompt = "plan.md.j2"
+            schema = "plan"
+            on = { ready = "implement", needs_decision = "approve" }
+            [stages.approve]
+            kind = "gate"
+            on = { approved = "implement", rejected = "@blocked" }
+            [stages.implement]
+            kind = "agent"
+            mode = "write"
+            prompt = "implement.md.j2"
+            on = { success = "verify", failure = "@blocked" }
+            [stages.verify]
+            kind = "command"
+            run = ".factory/verify.sh"
+            on = { success = "@publish", failure = "fix" }
+            [stages.fix]
+            kind = "agent"
+            mode = "write"
+            prompt = "fix.md.j2"
+            on = { success = "verify", failure = "@blocked" }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            skips_the_gate.ungated_writes(),
+            [id("implement"), id("fix")]
+        );
+        assert_eq!(Workflow::parse(MINIMAL).unwrap().ungated_writes(), []);
     }
 
     #[test]
