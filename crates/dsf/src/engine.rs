@@ -81,6 +81,9 @@ pub struct Config {
     pub state_dir: PathBuf,
     pub worker_image: String,
     pub model: String,
+    /// Models a workflow stage may ask for instead of `model`, from the
+    /// operator's `[models] allow`. Empty refuses every override.
+    pub allowed_models: Vec<String>,
     pub max_turns: u32,
     pub agent_timeout: Duration,
     pub limits: Limits,
@@ -677,6 +680,8 @@ impl Engine {
         let checkpoint = Sha::parse(stored.checkpoint_sha.as_deref().unwrap_or(base.as_str()))?;
         repo.reset_to(&checkpoint).await?;
         let (workflow, _) = Workflow::parse(&stored.workflow)?.clamp(&self.config.caps)?;
+        // The allow list may have changed since the run was suspended.
+        check_models(&workflow, &self.config.allowed_models).map_err(anyhow::Error::msg)?;
         let prompts = Prompts::from_snapshot(&dir.factory_snapshot())?;
         // Runs from before instructions were saved simply have none.
         let instructions = std::fs::read_to_string(dir.instructions()).unwrap_or_default();
@@ -808,6 +813,7 @@ impl Engine {
         let (workflow, adjustments) = workflow
             .clamp(&self.config.caps)
             .map_err(|e| e.to_string())?;
+        check_models(&workflow, &self.config.allowed_models)?;
         for adjustment in adjustments {
             self.event(run_id, "clamped", &adjustment.to_string());
         }
@@ -1087,6 +1093,7 @@ impl Engine {
                 mode,
                 prompt,
                 schema,
+                model,
             } => {
                 self.agent_stage(
                     run,
@@ -1097,6 +1104,7 @@ impl Engine {
                     mode,
                     &prompt,
                     schema,
+                    model.as_deref(),
                 )
                 .await
             }
@@ -1135,7 +1143,9 @@ impl Engine {
         mode: AgentMode,
         prompt_name: &str,
         schema: Option<Schema>,
+        model: Option<&str>,
     ) -> Result<StageResult> {
+        let model = model.unwrap_or(&self.config.model);
         let prompt = self.render_prompt(run, visit, prompt_name, schema).await?;
         std::fs::write(attempt_dir.join("prompt.md"), &prompt)?;
         let context = match self.stage_context(run, attempt_dir)? {
@@ -1145,7 +1155,7 @@ impl Engine {
         let argv = agent::command_line(&Invocation {
             mode,
             prompt: &prompt,
-            model: &self.config.model,
+            model,
             schema,
             max_turns: self.config.max_turns,
             system_prompt_file: context.system_prompt_file,
@@ -1153,6 +1163,7 @@ impl Engine {
             skills: context.skills,
         })?;
         let spec = self.agent_spec(run, attempt, argv, mode, context.binds);
+        self.event(run.id, "model", &format!("{stage} used {model}"));
         let stream_path = attempt_dir.join("stream.jsonl");
         let finished = self
             .sandbox
@@ -1721,6 +1732,23 @@ impl Engine {
     }
 }
 
+/// Refuses a workflow whose stages ask for models the operator hasn't
+/// allowed, since each override spends the operator's usage.
+fn check_models(workflow: &Workflow, allowed: &[String]) -> std::result::Result<(), String> {
+    let refused = workflow.disallowed_models(allowed);
+    if refused.is_empty() {
+        return Ok(());
+    }
+    let list = refused
+        .iter()
+        .map(|(stage, model)| format!("stage `{stage}` asks for model `{model}`"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(format!(
+        "{list}, which is not in the operator's [models] allow list; add it to `models.allow` in the config"
+    ))
+}
+
 fn read_lossy(path: &Path) -> String {
     String::from_utf8_lossy(&std::fs::read(path).unwrap_or_default()).into_owned()
 }
@@ -1902,6 +1930,19 @@ fn copy_tree(from: &Path, to: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn models_outside_the_allow_list_are_refused_by_name() {
+        let workflow = Workflow::parse(
+            "version = 1\nstart = \"review\"\n[stages.review]\nkind = \"agent\"\nmode = \"read\"\nprompt = \"r.md.j2\"\nmodel = \"big\"\non = { success = \"@publish\", failure = \"@blocked\" }\n",
+        )
+        .unwrap();
+        assert_eq!(check_models(&workflow, &["big".to_owned()]), Ok(()));
+        let message = check_models(&workflow, &[]).unwrap_err();
+        assert!(message.contains("`review`"), "{message}");
+        assert!(message.contains("`big`"), "{message}");
+        assert!(message.contains("models.allow"), "{message}");
+    }
 
     #[test]
     fn proxied_containers_reach_loopback_directly() {

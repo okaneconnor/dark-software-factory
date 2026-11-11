@@ -444,6 +444,8 @@ async fn run_issue_async(args: &RunArgs) -> Result<Outcome> {
             .clone()
             .unwrap_or_else(|| "dsf-worker:dev".to_owned()),
         model: worker.model.clone(),
+        // Local runs have no operator config, so stages cannot override the model.
+        allowed_models: Vec::new(),
         max_turns: 80,
         agent_timeout: worker.agent_timeout,
         limits: dsf::sandbox::Limits::default(),
@@ -531,6 +533,7 @@ async fn github_factory(
             .clone()
             .unwrap_or_else(|| config.worker_image.clone()),
         model: worker.model.clone(),
+        allowed_models: config.models.clone(),
         max_turns: 80,
         agent_timeout: worker.agent_timeout,
         limits: dsf::sandbox::Limits::default(),

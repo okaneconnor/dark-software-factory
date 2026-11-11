@@ -461,6 +461,7 @@ mod tests {
                                     mode: crate::workflow::AgentMode::Write,
                                     prompt: "x.md.j2".into(),
                                     schema: None,
+                                    model: None,
                                 },
                             };
                             let on = kind

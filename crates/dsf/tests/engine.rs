@@ -71,11 +71,16 @@ impl World {
     }
 
     fn engine_with_image(&self, model: &str, image: &str) -> Engine {
+        self.engine_allowing(model, image, &[])
+    }
+
+    fn engine_allowing(&self, model: &str, image: &str, allowed_models: &[&str]) -> Engine {
         let config = Config {
             instance: self.instance.clone(),
             state_dir: self.state.clone(),
             worker_image: image.to_owned(),
             model: model.to_owned(),
+            allowed_models: allowed_models.iter().map(|m| (*m).to_owned()).collect(),
             max_turns: 10,
             agent_timeout: Duration::from_secs(120),
             limits: dsf::sandbox::Limits {
@@ -683,6 +688,84 @@ async fn a_repo_can_bring_its_own_workflow() {
     let reason = blocked_reason(end);
     assert!(
         reason.contains("needs plan approval") && reason.contains("implement"),
+        "{reason}"
+    );
+    assert_eq!(world.published("calc.py"), None);
+}
+
+/// A workflow whose implement stage names its own model.
+fn workflow_with_model(model_line: &str) -> String {
+    WORKFLOW_WITHOUT_A_GATE.replace(
+        "prompt = \"implement.md.j2\"\n",
+        &format!("prompt = \"implement.md.j2\"\n{model_line}\n"),
+    )
+}
+
+fn commit_workflow(world: &World, text: &str) {
+    std::fs::write(world.origin.join(".factory/workflow.toml"), text).unwrap();
+    git(&world.origin, &["add", "--all"]);
+    git(&world.origin, &["commit", "--quiet", "-m", "own workflow"]);
+}
+
+fn model_events(world: &World, run_id: i64) -> Vec<String> {
+    let store = Store::open(&world.state.join("dsf.sqlite")).unwrap();
+    store
+        .events(run_id)
+        .unwrap()
+        .into_iter()
+        .filter(|(kind, _)| kind == "model")
+        .map(|(_, message)| message)
+        .collect()
+}
+
+/// A stage's own model reaches `claude --model` (the fake only finishes
+/// `slow-fix-calc` on `fast`) and is recorded; a stage without one uses
+/// the factory's.
+#[tokio::test]
+async fn a_stage_can_pick_an_allowed_model() {
+    if !enabled() {
+        return;
+    }
+    let world = World::new("stage-model");
+    commit_workflow(&world, &workflow_with_model("model = \"fast\""));
+    let end = world
+        .engine_allowing("slow", FAKE_IMAGE, &["fast"])
+        .start(&world.issue("fake-implement: slow-fix-calc"))
+        .await
+        .unwrap();
+    let RunEnd::Published { run_id, .. } = end else {
+        panic!("{end:?}")
+    };
+    assert_eq!(model_events(&world, run_id), ["implement used fast"]);
+
+    let world = World::new("factory-model");
+    commit_workflow(&world, &workflow_with_model(""));
+    let end = world
+        .engine_allowing("fast", FAKE_IMAGE, &[])
+        .start(&world.issue("fake-implement: slow-fix-calc"))
+        .await
+        .unwrap();
+    let RunEnd::Published { run_id, .. } = end else {
+        panic!("{end:?}")
+    };
+    assert_eq!(model_events(&world, run_id), ["implement used fast"]);
+}
+
+#[tokio::test]
+async fn a_model_outside_the_allow_list_blocks_the_run() {
+    if !enabled() {
+        return;
+    }
+    let world = World::new("model-refused");
+    commit_workflow(&world, &workflow_with_model("model = \"fast\""));
+    let end = world
+        .engine("slow")
+        .start(&world.issue("fake-implement: fix-calc"))
+        .await
+        .unwrap();
+    let reason = blocked_reason(end);
+    assert!(
+        reason.contains("`fast`") && reason.contains("models.allow"),
         "{reason}"
     );
     assert_eq!(world.published("calc.py"), None);

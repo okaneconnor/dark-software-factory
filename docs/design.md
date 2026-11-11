@@ -62,7 +62,7 @@ A workflow is a small graph of **stages**. Each stage has a kind and routes on i
 
 | Kind | Does | Outcome labels |
 |---|---|---|
-| `agent` | Runs Claude Code (invocation in §6.4). `mode = "read"` gives it only Read, Grep and Glob over a read-only worktree; `mode = "write"` adds Edit, Write and Bash. A `schema` makes Claude return structured output via `--json-schema`, whose `outcome` field becomes the label. | `success` / `failure`, or the schema's labels |
+| `agent` | Runs Claude Code (invocation in §6.4). `mode = "read"` gives it only Read, Grep and Glob over a read-only worktree; `mode = "write"` adds Edit, Write and Bash. A `schema` makes Claude return structured output via `--json-schema`, whose `outcome` field becomes the label. An optional `model` runs the stage on a different Claude model from the factory's `--model`, if the operator allows it. | `success` / `failure`, or the schema's labels |
 | `command` | Runs a command, e.g. `.factory/verify.sh`, in a container with no credentials | `success` / `failure` |
 | `gate` | Waits for a human decision on the issue (§5) | `approved` / `rejected` |
 
@@ -124,13 +124,13 @@ exhausted = "@publish"
 **Rules:**
 
 - **Stages.** Names match `[a-z][a-z0-9_-]*`, at most 32 characters. Unknown keys anywhere are errors, which is also what stops a repo from setting images, mounts or limits.
-- **Agent stages** need `mode` and `prompt`; `schema` is optional. There are two schemas: `plan`, with outcomes `ready` and `needs_decision`, and `review`, with `approve` and `changes_requested`.
+- **Agent stages** need `mode` and `prompt`; `schema` and `model` are optional. `model` must be in the operator's `[models] allow` list, otherwise the run is blocked when its workflow is loaded (again on resume, if the config changed); a stage without it uses `--model`. There are two schemas: `plan`, with outcomes `ready` and `needs_decision`, and `review`, with `approve` and `changes_requested`.
 - **Command stages** run one script under `.factory/`, with no shell and no arguments, from the snapshot of `.factory/` taken at the run's base commit, mounted read-only. Anything else, such as `make test`, is refused, because the agent could edit the `Makefile` and so weaken the check that judges its work. `timeout` defaults to 30 minutes. `network` defaults to `none`; `proxy` opts in to the egress proxy.
 - **Visit caps.** Each stage has a `max_visits` (default 1). When a stage would be entered beyond its cap, the run goes to the stage's `exhausted` target (default `@blocked`), which must be `@publish` or `@blocked`. Total work is therefore bounded by Σ `max_visits`, so every valid workflow terminates; a property test checks this over arbitrary graphs. The default workflow's budget is 13, and its longest possible run is 12 stage visits.
 - **Validation.** Every referenced stage exists, every outcome label a stage can produce has a route and no other label does, every stage is reachable from `start`, and `@publish` is reachable through a route or an `exhausted` target. Validation reports every problem at once.
 - **Repeat-failure breaker.** If a stage fails twice in a row with the same failure signature, the run goes to `@blocked` rather than spending the remaining visits. The signature is an FNV-1a hash of the last 40 lines of output after removing colour codes, timings, timestamps, addresses and temporary paths, so identical failures match while a change in what failed doesn't. Any other result from the stage resets it.
 - **Per-repo overrides.** A target repo may provide `.factory/workflow.toml` and `.factory/prompts/*.md.j2`. dsf reads them from the **default branch at claim time** and snapshots them into the run, so the agent cannot change the rules it is running under.
-- **Clamping.** Repo files may only tune what the operator allows. Visit counts and command timeouts above the operator's caps (by default 5 visits per stage and 60 minutes) are lowered, and the run reports each change. A workflow with more stages than the cap (default 16) is refused. Images, mounts, resource limits, agent-stage networking and protected paths are not settable from a repo at all. Publishing is built in and not configurable.
+- **Clamping.** Repo files may only tune what the operator allows. Visit counts and command timeouts above the operator's caps (by default 5 visits per stage and 60 minutes) are lowered, and the run reports each change. A workflow with more stages than the cap (default 16) is refused. Images, mounts, resource limits, agent-stage networking and protected paths are not settable from a repo at all, and a stage's `model` is limited to the operator's `[models] allow` list. Publishing is built in and not configurable.
 - **Prompts** are minijinja templates named `[a-z0-9_-]+.md.j2`, looked up in the run's snapshot, so a name can't point anywhere else. The defaults are embedded in the binary.
 
 ## 5. Run state, suspension and resume
@@ -141,7 +141,7 @@ State lives in SQLite as plain rows, updated in one transaction at each stage bo
 |---|---|
 | `runs` | Status, suspend reason, `resume_after`, next stage, visit counts, `base_sha`, `checkpoint_sha`, the workflow snapshot and hash, an issue snapshot (title, body, author, `updated_at`), the plan, the approval comment id, the last failure signature, the PR number |
 | `stage_attempts` | One row per stage attempt: visit number, status, outcome, failure class, container id, before and after SHAs, exit code, usage, structured output |
-| `events` | A human-readable timeline for the board and digest. Not the source of truth. |
+| `events` | A human-readable timeline for the board and digest, including the model each agent stage attempt used. Not the source of truth. |
 | `kv` | Factory-wide state: whether claiming is paused and why, `backoff_until` and what it's after, consecutive usage-limit hits and faults, the latest usage reading, and the last tick's record (the queue it saw, what it did and its problems) for `dsf status` and the board |
 
 A run moves `queued → running → suspended{approval | usage_limit | interrupted} → queued → …`. It ends in one of `published`, `blocked`, `publish_failed` or `canceled`.
@@ -242,6 +242,7 @@ The controls below are what make dsf safe to leave running unattended. [`CLAUDE.
   - repos and per-repo approval policy (`never`, `label` or `always`; default `label`);
   - the user allowlist, and the GitHub App's ID;
   - caps;
+  - `[models] allow`, the Claude models a workflow stage may name instead of `--model` (optional; absent or empty means stages cannot override the model, since each override spends the operator's usage);
   - extra egress hosts (the Anthropic API is always allowed);
   - the worker image;
   - extra protected paths;
