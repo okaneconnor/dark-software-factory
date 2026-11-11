@@ -1447,9 +1447,7 @@ impl Engine {
     fn network_for(&self, env: &mut Vec<(String, EnvValue)>, wants_egress: bool) -> Network {
         match (&self.config.egress, wants_egress) {
             (Egress::Proxy { network, proxy_url }, true) => {
-                for key in ["HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"] {
-                    env.push((key.to_owned(), EnvValue::Plain(proxy_url.clone())));
-                }
+                env.extend(proxy_env(proxy_url));
                 Network::Named(network.clone())
             }
             _ => Network::None,
@@ -1727,6 +1725,21 @@ fn read_lossy(path: &Path) -> String {
     String::from_utf8_lossy(&std::fs::read(path).unwrap_or_default()).into_owned()
 }
 
+/// The environment that sends a container's HTTP through the egress proxy.
+/// Loopback stays direct: it never leaves the container, and the proxy
+/// would refuse it anyway, which breaks tests that run a local server.
+fn proxy_env(proxy_url: &str) -> Vec<(String, EnvValue)> {
+    const LOOPBACK: &str = "localhost,127.0.0.1,::1";
+    let proxy =
+        ["HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"].map(|key| (key, proxy_url));
+    let direct = ["NO_PROXY", "no_proxy"].map(|key| (key, LOOPBACK));
+    proxy
+        .into_iter()
+        .chain(direct)
+        .map(|(key, value)| (key.to_owned(), EnvValue::Plain(value.to_owned())))
+        .collect()
+}
+
 /// The plan as later prompts and the PR body show it.
 fn plan_text(output: &Value) -> String {
     let mut text = output["summary"].as_str().unwrap_or_default().to_owned();
@@ -1889,6 +1902,23 @@ fn copy_tree(from: &Path, to: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proxied_containers_reach_loopback_directly() {
+        let env: HashMap<String, String> = proxy_env("http://dsf-proxy:3128")
+            .into_iter()
+            .map(|(key, value)| match value {
+                EnvValue::Plain(value) => (key, value),
+                EnvValue::Secret(_) => panic!("{key} shouldn't be secret"),
+            })
+            .collect();
+        for key in ["HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"] {
+            assert_eq!(env[key], "http://dsf-proxy:3128", "{key}");
+        }
+        for key in ["NO_PROXY", "no_proxy"] {
+            assert_eq!(env[key], "localhost,127.0.0.1,::1", "{key}");
+        }
+    }
 
     #[test]
     fn plan_text_lists_steps_and_questions() {
