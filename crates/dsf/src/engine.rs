@@ -943,7 +943,8 @@ impl Engine {
                         terminal: Terminal::Blocked,
                         reason,
                     }) => {
-                        let reason = self.masker.mask(&reason.to_string());
+                        let reason = blocked_reason(run, stage, &label, &end, reason);
+                        let reason = self.masker.mask(&reason);
                         let advance = Advance::End {
                             status: RunStatus::Blocked,
                             reason: &reason,
@@ -1338,7 +1339,8 @@ impl Engine {
                 Some(Schema::Review) => {
                     run.review = (label == "changes_requested").then(|| review_text(output));
                 }
-                None => {}
+                // Already saved on the attempt; `conclude` reads it if blocked.
+                Some(Schema::Implement) | None => {}
             }
         }
         Ok(StageResult::Outcome {
@@ -1771,6 +1773,37 @@ fn review_text(output: &Value) -> String {
     text
 }
 
+/// The reason a run blocked. An implement stage that gave up says why; the
+/// comment prints this reason, so adding it here puts it through the masker.
+fn blocked_reason(
+    run: &Run,
+    stage: &StageId,
+    label: &str,
+    end: &Ended,
+    reason: impl std::fmt::Display,
+) -> String {
+    let mut reason = reason.to_string();
+    let implement = matches!(
+        run.workflow.stage(stage).map(|s| &s.kind),
+        Some(StageKind::Agent {
+            schema: Some(Schema::Implement),
+            ..
+        })
+    );
+    if let (true, "blocked", Some(output)) = (implement, label, &end.structured) {
+        let _ = write!(reason, "\n\n{}", blocked_text(output));
+    }
+    reason
+}
+
+fn blocked_text(output: &Value) -> String {
+    let mut text = output["summary"].as_str().unwrap_or_default().to_owned();
+    for blocker in output["blockers"].as_array().cloned().unwrap_or_default() {
+        let _ = write!(text, "\n- {}", blocker.as_str().unwrap_or_default());
+    }
+    text
+}
+
 /// What a pull request's description is written from.
 struct PullRequestFacts<'a> {
     run_id: i64,
@@ -1939,6 +1972,13 @@ mod tests {
         let output =
             serde_json::json!({ "summary": "Close.", "issues": ["Add a test", "Rename x"] });
         assert_eq!(review_text(&output), "Close.\n- Add a test\n- Rename x");
+    }
+
+    #[test]
+    fn blocked_text_lists_blockers() {
+        let output =
+            serde_json::json!({ "summary": "Stuck.", "blockers": ["Need a key", "Pick a db"] });
+        assert_eq!(blocked_text(&output), "Stuck.\n- Need a key\n- Pick a db");
     }
 
     fn attempt(id: i64, stage: &str, outcome: &str, structured: Option<Value>) -> Attempt {

@@ -115,6 +115,11 @@ pub const fn json_schema(schema: Schema) -> &'static str {
             r#""summary":{"type":"string"},"steps":{"type":"array","items":{"type":"string"}},"#,
             r#""questions":{"type":"array","items":{"type":"string"}}}}"#
         ),
+        Schema::Implement => concat!(
+            r#"{"type":"object","additionalProperties":false,"required":["outcome","summary"],"#,
+            r#""properties":{"outcome":{"type":"string","enum":["done","blocked"]},"#,
+            r#""summary":{"type":"string"},"blockers":{"type":"array","items":{"type":"string"}}}}"#
+        ),
         Schema::Review => concat!(
             r#"{"type":"object","additionalProperties":false,"required":["outcome","summary"],"#,
             r#""properties":{"outcome":{"type":"string","enum":["approve","changes_requested"]},"#,
@@ -524,7 +529,7 @@ mod tests {
 
     #[test]
     fn schema_outcomes_match_the_workflow_labels() {
-        for schema in [Schema::Plan, Schema::Review] {
+        for schema in [Schema::Plan, Schema::Review, Schema::Implement] {
             let json: Value = serde_json::from_str(json_schema(schema)).unwrap();
             let labels: Vec<&str> = json["properties"]["outcome"]["enum"]
                 .as_array()

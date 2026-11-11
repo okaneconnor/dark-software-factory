@@ -124,7 +124,18 @@ exhausted = "@publish"
 **Rules:**
 
 - **Stages.** Names match `[a-z][a-z0-9_-]*`, at most 32 characters. Unknown keys anywhere are errors, which is also what stops a repo from setting images, mounts or limits.
-- **Agent stages** need `mode` and `prompt`; `schema` is optional. There are two schemas: `plan`, with outcomes `ready` and `needs_decision`, and `review`, with `approve` and `changes_requested`.
+- **Agent stages** need `mode` and `prompt`; `schema` is optional. There are three schemas: `plan`, with outcomes `ready` and `needs_decision`; `review`, with `approve` and `changes_requested`; and `implement`, with `done` and `blocked`, which is for write-mode stages only. An `implement` stage lets the agent say it can't finish, for example because the issue needs a decision or something outside the repo is missing:
+
+  ```toml
+  [stages.implement]
+  kind = "agent"
+  mode = "write"
+  prompt = "implement.md.j2"
+  schema = "implement"
+  on = { done = "verify", blocked = "@blocked" }
+  ```
+
+  Both outcomes must be routed. When the stage ends `blocked` and routes to `@blocked`, the run ends at once, without passing half-done work to verify, and the issue comment carries the agent's summary and blockers, after masking. The built-in workflow doesn't use this schema.
 - **Command stages** run one script under `.factory/`, with no shell and no arguments, from the snapshot of `.factory/` taken at the run's base commit, mounted read-only. Anything else, such as `make test`, is refused, because the agent could edit the `Makefile` and so weaken the check that judges its work. `timeout` defaults to 30 minutes. `network` defaults to `none`; `proxy` opts in to the egress proxy.
 - **Visit caps.** Each stage has a `max_visits` (default 1). When a stage would be entered beyond its cap, the run goes to the stage's `exhausted` target (default `@blocked`), which must be `@publish` or `@blocked`. Total work is therefore bounded by Σ `max_visits`, so every valid workflow terminates; a property test checks this over arbitrary graphs. The default workflow's budget is 13, and its longest possible run is 12 stage visits.
 - **Validation.** Every referenced stage exists, every outcome label a stage can produce has a route and no other label does, every stage is reachable from `start`, and `@publish` is reachable through a route or an `exhausted` target. Validation reports every problem at once.

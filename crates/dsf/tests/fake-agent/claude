@@ -36,6 +36,11 @@ case "$stage:$action" in
     structured='{"outcome":"changes_requested","summary":"Nearly there.","issues":["Add a regression test for add()"]}' ;;
   review:*)
     structured='{"outcome":"approve","summary":"Correct and minimal."}' ;;
+  implement:blocked)
+    structured='{"outcome":"blocked","summary":"Needs an API key I do not have.","blockers":["Provide STRIPE_KEY"]}' ;;
+  implement:blocked-token)
+    structured="{\"outcome\":\"blocked\",\"summary\":\"Stuck.\",\"blockers\":[\"Found ghp_$(printf 'A%.0s' $(seq 1 36)) in the env\"]}" ;;
+  implement:done) fix_calc; structured='{"outcome":"done","summary":"Fixed add()."}' ;;
   *:fix-calc) fix_calc ;;
   *:slow-fix-calc) [ "$model" = "fast" ] || sleep 120; fix_calc ;;
   *:touch-factory) echo 'exit 0' >> .factory/verify.sh ;;
