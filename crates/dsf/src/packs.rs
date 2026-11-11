@@ -265,7 +265,7 @@ mod tests {
             names.push(pack.name);
         }
         names.sort();
-        assert_eq!(names, ["rust", "terraform-azure"]);
+        assert_eq!(names, ["practices", "rust", "terraform-azure"]);
     }
 
     #[test]
