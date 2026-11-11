@@ -138,11 +138,14 @@ pub enum AgentMode {
 pub enum Schema {
     Plan,
     Review,
+    /// Lets a write-mode stage end by saying it can't finish.
+    Implement,
 }
 
 impl Schema {
     pub const fn outcomes(self) -> &'static [&'static str] {
         match self {
+            Self::Implement => &["done", "blocked"],
             Self::Plan => &["ready", "needs_decision"],
             Self::Review => &["approve", "changes_requested"],
         }
@@ -337,6 +340,11 @@ pub enum Problem {
         outcome: String,
         target: String,
     },
+    #[error("stage `{stage}`: schema `{schema}` needs `mode = \"write\"`")]
+    SchemaNeedsWriteMode {
+        stage: StageId,
+        schema: &'static str,
+    },
     #[error("stage `{stage}`: outcome `{outcome}` has no route in `on`")]
     MissingRoute {
         stage: StageId,
@@ -510,6 +518,12 @@ impl RawStage {
             problems.push(Problem::InvalidPrompt {
                 stage: id.clone(),
                 prompt: prompt.clone(),
+            });
+        }
+        if self.schema == Some(Schema::Implement) && mode == Some(AgentMode::Read) {
+            problems.push(Problem::SchemaNeedsWriteMode {
+                stage: id.clone(),
+                schema: "implement",
             });
         }
         Some(StageKind::Agent {
@@ -963,6 +977,66 @@ mod tests {
                     outcome: "changes_requested"
                 },
             ]
+        );
+    }
+
+    const IMPLEMENT: &str = r#"
+        version = 1
+        start = "implement"
+        [stages.implement]
+        kind = "agent"
+        mode = "write"
+        prompt = "implement.md.j2"
+        schema = "implement"
+        on = { done = "@publish", blocked = "@blocked" }
+        "#;
+
+    #[test]
+    fn implement_schema_parses_on_a_write_stage() {
+        let workflow = Workflow::parse(IMPLEMENT).expect("valid");
+        let stage = workflow.stage(&id("implement")).expect("stage");
+        assert!(matches!(
+            &stage.kind,
+            StageKind::Agent {
+                mode: AgentMode::Write,
+                schema: Some(Schema::Implement),
+                ..
+            }
+        ));
+        assert_eq!(stage.kind.outcomes(), ["done", "blocked"]);
+    }
+
+    #[test]
+    fn implement_schema_needs_both_routes_and_no_others() {
+        let toml = IMPLEMENT.replace(
+            "{ done = \"@publish\", blocked = \"@blocked\" }",
+            "{ done = \"@publish\", success = \"@publish\" }",
+        );
+        assert_eq!(
+            problems(&toml),
+            [
+                Problem::UnexpectedOutcome {
+                    stage: id("implement"),
+                    outcome: "success".into(),
+                    produces: Schema::Implement.outcomes(),
+                },
+                Problem::MissingRoute {
+                    stage: id("implement"),
+                    outcome: "blocked"
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn implement_schema_is_rejected_on_a_read_stage() {
+        let toml = IMPLEMENT.replace("mode = \"write\"", "mode = \"read\"");
+        assert_eq!(
+            problems(&toml),
+            [Problem::SchemaNeedsWriteMode {
+                stage: id("implement"),
+                schema: "implement",
+            }]
         );
     }
 

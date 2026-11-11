@@ -688,6 +688,85 @@ async fn a_repo_can_bring_its_own_workflow() {
     assert_eq!(world.published("calc.py"), None);
 }
 
+const WORKFLOW_WITH_IMPLEMENT_SCHEMA: &str = r#"
+version = 1
+start = "implement"
+[stages.implement]
+kind = "agent"
+mode = "write"
+prompt = "implement.md.j2"
+schema = "implement"
+on = { done = "verify", blocked = "@blocked" }
+[stages.verify]
+kind = "command"
+run = ".factory/verify.sh"
+max_visits = 50
+on = { success = "@publish", failure = "@blocked" }
+"#;
+
+#[tokio::test]
+async fn an_implement_stage_can_report_that_it_cannot_finish() {
+    if !enabled() {
+        return;
+    }
+    for (name, action) in [("blocked", "blocked"), ("masked", "blocked-token")] {
+        let world = World::new(&format!("implement-{name}"));
+        std::fs::write(
+            world.origin.join(".factory/workflow.toml"),
+            WORKFLOW_WITH_IMPLEMENT_SCHEMA,
+        )
+        .unwrap();
+        git(&world.origin, &["add", "--all"]);
+        git(&world.origin, &["commit", "--quiet", "-m", "own workflow"]);
+        let end = world
+            .engine("fake")
+            .start(&world.issue(&format!("fake-implement: {action}")))
+            .await
+            .unwrap();
+        let RunEnd::Blocked { run_id, reason } = end else {
+            panic!("{end:?}")
+        };
+        if name == "blocked" {
+            assert!(
+                reason.contains("Needs an API key I do not have.")
+                    && reason.contains("- Provide STRIPE_KEY"),
+                "{reason}"
+            );
+        } else {
+            assert!(
+                reason.contains("Stuck.") && !reason.contains("ghp_AAAA"),
+                "{reason}"
+            );
+        }
+        assert_eq!(world.stages(run_id), ["implement"]);
+        assert_eq!(world.published("calc.py"), None);
+    }
+}
+
+#[tokio::test]
+async fn an_implement_stage_that_is_done_goes_on_to_verify() {
+    if !enabled() {
+        return;
+    }
+    let world = World::new("implement-done");
+    std::fs::write(
+        world.origin.join(".factory/workflow.toml"),
+        WORKFLOW_WITH_IMPLEMENT_SCHEMA,
+    )
+    .unwrap();
+    git(&world.origin, &["add", "--all"]);
+    git(&world.origin, &["commit", "--quiet", "-m", "own workflow"]);
+    let end = world
+        .engine("fake")
+        .start(&world.issue("fake-implement: done"))
+        .await
+        .unwrap();
+    let RunEnd::Published { run_id, .. } = end else {
+        panic!("{end:?}")
+    };
+    assert_eq!(world.stages(run_id), ["implement", "verify"]);
+}
+
 /// The repository's instructions and the operator's packs reach the
 /// agent: the system-prompt file, each pack as a plugin, the Skill tool.
 #[tokio::test]
