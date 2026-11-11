@@ -1,5 +1,5 @@
 # The image agent and verify stages run in: Claude Code, git, common build
-# tools and Terraform. dsf runs it as the factory user's uid with a
+# tools, Terraform and Rust. dsf runs it as the factory user's uid with a
 # read-only root filesystem and tmpfs HOME, so nothing here needs to be
 # writable.
 
@@ -54,24 +54,47 @@ RUN apt-get update \
  && mkdir -p /usr/local/share/tflint/plugins \
  && unzip -q /tmp/azurerm.zip tflint-ruleset-azurerm -d /usr/local/share/tflint/plugins
 
+# Rust, for Rust repos' agents and verify, dsf's own among them: the
+# toolchain dsf's rust-toolchain.toml pins, with clippy and rustfmt, from the
+# official image pinned by its multi-arch digest. Stages can't download a
+# toolchain (the egress proxy doesn't allow rustup's host), so a repo that
+# pins a different version fails at once rather than mid-build. Bump the
+# tag, the digest and rust-toolchain.toml together.
+FROM rust:1.99.1-slim-bookworm@sha256:f2c004e3d2d8b547e8cf7ffbc29205385f4e71d23e53e4e383065db5e9f822cd AS rust
+RUN rustup component add clippy rustfmt \
+ && chmod -R go-w "$RUSTUP_HOME"
+
 FROM node:22-bookworm-slim
 
 # Pinned: a Claude Code upgrade is a deliberate change, re-checked against
 # the spike findings (stream format, flags, egress hosts).
 ARG CLAUDE_CODE_VERSION=2.1.292
 
+# gcc and libc6-dev are Rust's linker and what crates with C code (bundled
+# SQLite, ring) build with; openssl is the command dsf's tests make keys with.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates git make python3 \
+      gcc libc6-dev openssl \
  && rm -rf /var/lib/apt/lists/*
 RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
  && npm cache clean --force
 COPY --from=terraform /usr/local/bin/terraform /usr/local/bin/terraform
 COPY --from=tflint /usr/local/bin/tflint /usr/local/bin/tflint
 COPY --from=tflint /usr/local/share/tflint /usr/local/share/tflint
+# Only rustup itself; the commands that run the toolchain are links to it.
+COPY --from=rust /usr/local/rustup /usr/local/rustup
+COPY --from=rust /usr/local/cargo/bin/rustup /usr/local/cargo/bin/rustup
+RUN for tool in cargo cargo-clippy cargo-fmt clippy-driver rustc rustdoc rustfmt; do \
+      ln -s rustup "/usr/local/cargo/bin/$tool"; \
+    done
 
 # Terraform's update check would only be refused by the egress proxy, and
 # TF_IN_AUTOMATION keeps its output free of "now run terraform apply" hints.
-ENV DISABLE_AUTOUPDATER=1 \
+# Cargo keeps its downloads in the default ~/.cargo, on the tmpfs HOME, as
+# the toolchain under /usr/local is read-only when a stage runs.
+ENV RUSTUP_HOME=/usr/local/rustup \
+    PATH=/usr/local/cargo/bin:$PATH \
+    DISABLE_AUTOUPDATER=1 \
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
     CHECKPOINT_DISABLE=1 \
     TF_IN_AUTOMATION=1 \

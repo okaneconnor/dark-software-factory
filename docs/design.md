@@ -300,7 +300,7 @@ docs/                 this document and operations notes
 | Secrets, time | secrecy, jiff (DST-correct scheduling) |
 | Tests | insta, wiremock, proptest, tempfile, assert_cmd |
 
-**Releases.** Pushing a tag `vX.Y.Z` that matches the crate version runs `release.yml`. It builds a static `x86_64-unknown-linux-musl` binary and publishes it as `dsf-vX.Y.Z-x86_64-unknown-linux-musl.tar.gz` with a `.sha256` file. It also pushes two images to GHCR, both tagged with the version: `dsf`, the same binary on Debian slim, which runs the proxy sidecar; and `dsf-worker`, with Claude Code pinned in `worker/Dockerfile`. The release notes list both image digests, which go into the config's `[images]`; dsf never pulls, so a deployment runs exactly the images it was given. Pull requests that change the packaging build all of this without publishing. The build and publish steps are separate jobs, and only the publish job, on a tag, can write.
+**Releases.** Pushing a tag `vX.Y.Z` that matches the crate version runs `release.yml`. It builds a static `x86_64-unknown-linux-musl` binary and publishes it as `dsf-vX.Y.Z-x86_64-unknown-linux-musl.tar.gz` with a `.sha256` file. It also pushes two images to GHCR, both tagged with the version: `dsf`, the same binary on Debian slim, which runs the proxy sidecar; and `dsf-worker`, with Claude Code, Terraform, tflint and the Rust toolchain pinned in `worker/Dockerfile`. The release notes list both image digests, which go into the config's `[images]`; dsf never pulls, so a deployment runs exactly the images it was given. Pull requests that change the packaging build all of this without publishing. The build and publish steps are separate jobs, and only the publish job, on a tag, can write.
 
 ## 9. Design choices
 

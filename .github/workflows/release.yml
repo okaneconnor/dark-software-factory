@@ -68,6 +68,10 @@ jobs:
           docker run --rm dsf-worker:release claude --version
           docker run --rm dsf-worker:release terraform version
           docker run --rm dsf-worker:release tflint --version
+          # The toolchain rust-toolchain.toml pins must already be in the
+          # image: with no network, rustup can't fetch a missing one.
+          docker run --rm --network none --volume "$PWD:/work:ro" --workdir /work \
+            dsf-worker:release sh -c 'cargo --version && cargo clippy --version && cargo fmt --version'
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release
