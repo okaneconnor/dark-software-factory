@@ -24,6 +24,14 @@ weekly_usage_cap = 80
 
 state_dir = "/var/lib/dsf"
 
+# No run starts or continues while the state directory's disk has less free
+# space than this, in GB. `dsf doctor` fails below it too.
+min_free_disk_gb = 5
+
+# How long a finished run's files (its clone, worktree and logs) stay on
+# disk. Its record, and the branch it pushed, stay for good.
+run_retention = "14d"
+
 [github]
 # Issues are picked up only when both the author and whoever added
 # factory:ready are listed here.

@@ -11,7 +11,7 @@ use dsf_core::workflow::StageId;
 use jiff::tz::TimeZone;
 use jiff::{SignedDuration, Timestamp};
 
-use crate::scheduler::{BACKOFF_UNTIL, LAST_TICK, PAUSED, TickRecord, local};
+use crate::scheduler::{BACKOFF_REASON, BACKOFF_UNTIL, LAST_TICK, PAUSED, TickRecord, local};
 use crate::store::{Attempt, Run, RunStatus, Store, SuspendReason};
 use crate::usage::{UsageReading, percent};
 
@@ -24,6 +24,8 @@ pub struct Board {
     pub now: Timestamp,
     pub paused: Option<String>,
     pub backoff_until: Option<Timestamp>,
+    /// What the backoff is after, e.g. `a usage limit`.
+    pub backoff_reason: Option<String>,
     pub usage: Option<UsageReading>,
     pub last_tick: Option<TickRecord>,
     /// Unfinished runs, each with its latest attempt.
@@ -46,6 +48,7 @@ impl Board {
                 .kv_get(BACKOFF_UNTIL)?
                 .and_then(|text| text.parse().ok())
                 .filter(|until| *until > now),
+            backoff_reason: store.kv_get(BACKOFF_REASON)?,
             usage: UsageReading::load(store)?,
             last_tick: store
                 .kv_get(LAST_TICK)?
@@ -70,10 +73,17 @@ impl Board {
                 let _ = writeln!(out, "  {item}");
             }
         }
-        if let Some(tick) = self.last_tick.as_ref().filter(|t| !t.notes.is_empty()) {
-            let _ = writeln!(out, "\nLast tick's notes");
-            for note in &tick.notes {
-                let _ = writeln!(out, "  {note}");
+        if let Some(tick) = &self.last_tick {
+            for (title, lines) in [
+                ("Last tick's problems", &tick.problems),
+                ("Last tick's notes", &tick.notes),
+            ] {
+                if !lines.is_empty() {
+                    let _ = writeln!(out, "\n{title}");
+                    for line in lines {
+                        let _ = writeln!(out, "  {line}");
+                    }
+                }
             }
         }
         out
@@ -109,7 +119,8 @@ impl Board {
                 local(until, tz)
             )
         } else if let Some(until) = self.backoff_until {
-            format!("backing off after a usage limit until {}", local(until, tz))
+            let after = self.backoff_reason.as_deref().unwrap_or("a usage limit");
+            format!("backing off after {after} until {}", local(until, tz))
         } else {
             "allowed".to_owned()
         }
@@ -443,6 +454,7 @@ mod tests {
                 },
             ],
             notes: vec!["octo/calc#8: it's blocked by open issue #7".into()],
+            problems: vec!["the worker image w isn't on this host".into()],
         };
         store
             .kv_set(LAST_TICK, &serde_json::to_string(&tick).unwrap())
@@ -520,6 +532,7 @@ mod tests {
                 },
             ],
             notes: Vec::new(),
+            problems: Vec::new(),
         };
         store
             .kv_set(LAST_TICK, &serde_json::to_string(&tick).unwrap())
