@@ -303,6 +303,7 @@ impl World {
             state_dir: self.state.clone(),
             worker_image: image.to_owned(),
             model: model.to_owned(),
+            allowed_models: Vec::new(),
             max_turns: 10,
             agent_timeout: Duration::from_secs(180),
             limits: dsf::sandbox::Limits {

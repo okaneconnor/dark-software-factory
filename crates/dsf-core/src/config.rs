@@ -15,6 +15,7 @@ use serde::Deserialize;
 use crate::clamp::Caps;
 use crate::duration;
 use crate::issue::{Allowlist, ApprovalPolicy};
+use crate::model::is_model_name;
 use crate::protect::{self, ProtectedPaths};
 use crate::schedule::Window;
 
@@ -69,6 +70,10 @@ pub struct Config {
     /// Where standards packs live, one directory per pack, if any repo
     /// uses them.
     pub packs_dir: Option<PathBuf>,
+    /// Claude models a workflow stage may ask for instead of the factory's
+    /// own, sorted and deduplicated. Empty means stages cannot override the
+    /// model.
+    pub models: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,6 +181,15 @@ struct RawConfig {
     protect: RawProtect,
     #[serde(default)]
     packs: RawPacks,
+    #[serde(default)]
+    models: RawModels,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawModels {
+    #[serde(default)]
+    allow: Vec<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -491,6 +505,21 @@ impl RawConfig {
         }
         let protected = ProtectedPaths::new(&self.protect.extra);
 
+        let mut models: Vec<String> = Vec::new();
+        for model in &self.models.allow {
+            let model = model.trim();
+            if is_model_name(model) {
+                models.push(model.to_owned());
+            } else {
+                check.fail(
+                    "models.allow",
+                    format!("`{model}` is not a model name like claude-sonnet-5-5"),
+                );
+            }
+        }
+        models.sort();
+        models.dedup();
+
         if !check.problems.is_empty() {
             return Err(check.problems);
         }
@@ -513,6 +542,7 @@ impl RawConfig {
             protected,
             protect_extra: self.protect.extra,
             packs_dir,
+            models,
         })
     }
 }
@@ -602,6 +632,7 @@ mod tests {
             config.dsf_image.as_deref(),
             Some("ghcr.io/your-github-login/dsf:v0.1.0")
         );
+        assert_eq!(config.models, Vec::<String>::new());
     }
 
     #[test]
@@ -701,6 +732,28 @@ mod tests {
             Config::parse(MINIMAL).unwrap().repos[0].packs,
             Vec::<String>::new()
         );
+    }
+
+    #[test]
+    fn models_default_to_none_and_are_deduplicated() {
+        assert_eq!(Config::parse(MINIMAL).unwrap().models, Vec::<String>::new());
+        let toml =
+            format!("{MINIMAL}\n[models]\nallow = [\" b-model \", \"a-model\", \"b-model\"]");
+        assert_eq!(Config::parse(&toml).unwrap().models, ["a-model", "b-model"]);
+        let empty = format!("{MINIMAL}\n[models]\nallow = []");
+        assert_eq!(Config::parse(&empty).unwrap().models, Vec::<String>::new());
+    }
+
+    #[test]
+    fn invalid_model_names_are_reported() {
+        let toml = format!("{MINIMAL}\n[models]\nallow = [\"--x\", \"\", \"ok\"]");
+        assert_eq!(fields(&toml), ["models.allow", "models.allow"]);
+    }
+
+    #[test]
+    fn unknown_keys_under_models_are_errors() {
+        let toml = format!("{MINIMAL}\n[models]\ndeny = []");
+        assert!(matches!(Config::parse(&toml), Err(ConfigError::Toml(_))));
     }
 
     #[test]

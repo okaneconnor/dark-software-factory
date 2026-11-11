@@ -11,6 +11,7 @@ pub mod config;
 pub mod duration;
 pub mod issue;
 pub mod labels;
+pub mod model;
 pub mod protect;
 pub mod routing;
 pub mod schedule;

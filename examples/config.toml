@@ -62,6 +62,13 @@ max_stages = 16
 # "registry.terraform.io" and "releases.hashicorp.com".
 allow = ["registry.npmjs.org", "pypi.org", "files.pythonhosted.org", "index.crates.io", "static.crates.io"]
 
+[models]
+# Claude models a repo's workflow may pick per stage with `model = "..."`,
+# instead of the factory's own. Absent or empty: stages cannot override the
+# model. A workflow naming any other model is blocked.
+# allow = ["claude-opus-5-5", "claude-haiku-4-5-20251001"]
+allow = []
+
 [images]
 # Pin both by the digests in the release notes, e.g.
 # "ghcr.io/okaneconnor/dsf-worker@sha256:...".

@@ -11,6 +11,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::duration::{self, DurationError};
+use crate::model::is_model_name;
 
 /// The built-in workflow, used when a repo doesn't provide its own.
 pub const DEFAULT_TOML: &str = include_str!("../../../defaults/workflow.toml");
@@ -165,6 +166,10 @@ pub enum StageKind {
         mode: AgentMode,
         prompt: String,
         schema: Option<Schema>,
+        /// A Claude model for this stage instead of the factory's own. The
+        /// operator's `[models] allow` list gates it; see
+        /// [`Workflow::disallowed_models`].
+        model: Option<String>,
     },
     Command {
         run: String,
@@ -272,6 +277,21 @@ impl Workflow {
         writes
     }
 
+    /// The stages that ask for a model outside `allowed`, with that model.
+    /// An empty `allowed` flags every override. Pure, so the engine can
+    /// apply the operator's list when it loads a workflow.
+    pub fn disallowed_models(&self, allowed: &[String]) -> Vec<(&StageId, &str)> {
+        self.stages
+            .iter()
+            .filter_map(|(id, stage)| match &stage.kind {
+                StageKind::Agent {
+                    model: Some(model), ..
+                } if !allowed.contains(model) => Some((id, model.as_str())),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The most stage visits any run of this workflow can make: the sum of
     /// every stage's `max_visits`. This bound is why every run terminates.
     pub fn visit_budget(&self) -> u32 {
@@ -319,6 +339,8 @@ pub enum Problem {
         "stage `{stage}`: `run` must be the path of a script under .factory/, with no arguments (got `{run}`)"
     )]
     InvalidCommand { stage: StageId, run: String },
+    #[error("stage `{stage}`: `{model}` is not a model name")]
+    InvalidModel { stage: StageId, model: String },
     #[error("stage `{stage}`: timeout `{value}`: {reason}")]
     InvalidTimeout {
         stage: StageId,
@@ -372,6 +394,7 @@ struct RawStage {
     mode: Option<AgentMode>,
     prompt: Option<String>,
     schema: Option<Schema>,
+    model: Option<String>,
     run: Option<String>,
     timeout: Option<String>,
     network: Option<Network>,
@@ -457,11 +480,13 @@ impl RawStage {
                 reject("mode", self.mode.is_some());
                 reject("prompt", self.prompt.is_some());
                 reject("schema", self.schema.is_some());
+                reject("model", self.model.is_some());
             }
             Kind::Gate => {
                 reject("mode", self.mode.is_some());
                 reject("prompt", self.prompt.is_some());
                 reject("schema", self.schema.is_some());
+                reject("model", self.model.is_some());
                 reject("run", self.run.is_some());
                 reject("timeout", self.timeout.is_some());
                 reject("network", self.network.is_some());
@@ -512,10 +537,19 @@ impl RawStage {
                 prompt: prompt.clone(),
             });
         }
+        if let Some(model) = &self.model
+            && !is_model_name(model)
+        {
+            problems.push(Problem::InvalidModel {
+                stage: id.clone(),
+                model: model.clone(),
+            });
+        }
         Some(StageKind::Agent {
             mode: mode?,
             prompt: prompt?,
             schema: self.schema,
+            model: self.model.clone(),
         })
     }
 
@@ -771,6 +805,83 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    const AGENT: &str = r#"
+        version = 1
+        start = "a"
+        [stages.a]
+        kind = "agent"
+        mode = "read"
+        prompt = "a.md.j2"
+        MODEL
+        on = { success = "@publish", failure = "@blocked" }
+    "#;
+
+    fn agent_with(model_line: &str) -> String {
+        AGENT.replace("MODEL", model_line)
+    }
+
+    #[test]
+    fn a_stage_may_name_a_model_and_the_allow_list_gates_it() {
+        let workflow = Workflow::parse(&agent_with("model = \"fast\"")).unwrap();
+        let allowed = ["fast".to_owned()];
+        assert_eq!(workflow.disallowed_models(&allowed).len(), 0);
+        assert_eq!(workflow.disallowed_models(&[]), [(&id("a"), "fast")]);
+        assert_eq!(
+            workflow.disallowed_models(&["slow".to_owned()]),
+            [(&id("a"), "fast")]
+        );
+    }
+
+    #[test]
+    fn a_stage_without_a_model_needs_no_allowance() {
+        let workflow = Workflow::parse(&agent_with("")).unwrap();
+        assert_eq!(workflow.disallowed_models(&[]).len(), 0);
+        assert!(matches!(
+            workflow.stage(&id("a")).unwrap().kind,
+            StageKind::Agent { model: None, .. }
+        ));
+    }
+
+    #[test]
+    fn model_is_only_for_agent_stages() {
+        let command = MINIMAL.replace("run =", "model = \"fast\"\n        run =");
+        assert_eq!(
+            problems(&command),
+            [Problem::FieldNotAllowed {
+                stage: id("build"),
+                kind: Kind::Command,
+                field: "model"
+            }]
+        );
+        let gate = r#"
+            version = 1
+            start = "g"
+            [stages.g]
+            kind = "gate"
+            model = "fast"
+            on = { approved = "@publish", rejected = "@blocked" }
+        "#;
+        assert_eq!(
+            problems(gate),
+            [Problem::FieldNotAllowed {
+                stage: id("g"),
+                kind: Kind::Gate,
+                field: "model"
+            }]
+        );
+    }
+
+    #[test]
+    fn a_malformed_model_is_rejected() {
+        assert_eq!(
+            problems(&agent_with("model = \"--dangerous\"")),
+            [Problem::InvalidModel {
+                stage: id("a"),
+                model: "--dangerous".into()
+            }]
+        );
     }
 
     #[test]
