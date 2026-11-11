@@ -56,6 +56,9 @@ pub struct Context<'a> {
     pub diff: Option<String>,
     pub verify_output: Option<String>,
     pub review: Option<&'a str>,
+    /// The same stage's findings from its previous visit, when that visit
+    /// requested changes. Empty on a first visit or after an approval.
+    pub previous_review: Option<&'a str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -201,6 +204,7 @@ mod tests {
             diff: Some("-    return a - b\n+    return a + b".into()),
             verify_output: Some("FAILED: expected 5, got -1".into()),
             review: Some("Add a regression test."),
+            previous_review: None,
         }
     }
 
@@ -218,6 +222,37 @@ mod tests {
             let rendered = prompts.render(name, &context(&protected)).unwrap();
             insta::assert_snapshot!(name, rendered);
         }
+    }
+
+    #[test]
+    fn review_prompt_shows_earlier_findings_on_a_re_review() {
+        let prompts = Prompts::new(BTreeMap::new()).unwrap();
+        let protected = protected();
+        let first = prompts
+            .render("review.md.j2", &context(&protected))
+            .unwrap();
+        assert!(!first.contains("previous_review"));
+        insta::assert_snapshot!("review_first_visit", first);
+
+        let mut again = context(&protected);
+        again.previous_review = Some("Close.\n- calc.py: add() has no test");
+        let second = prompts.render("review.md.j2", &again).unwrap();
+        insta::assert_snapshot!("review_second_visit", second);
+    }
+
+    #[test]
+    fn templates_that_ignore_previous_review_render_as_before() {
+        let overrides = BTreeMap::from([(
+            "fix.md.j2".to_owned(),
+            "Fix #{{ issue.number }}: {{ review }}".to_owned(),
+        )]);
+        let prompts = Prompts::new(overrides).unwrap();
+        let protected = protected();
+        let plain = prompts.render("fix.md.j2", &context(&protected)).unwrap();
+        let mut again = context(&protected);
+        again.previous_review = Some("Earlier findings.");
+        assert_eq!(prompts.render("fix.md.j2", &again).unwrap(), plain);
+        assert_eq!(plain, "Fix #7: Add a regression test.");
     }
 
     #[test]
