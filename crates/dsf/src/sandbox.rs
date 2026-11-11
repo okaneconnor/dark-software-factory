@@ -124,6 +124,17 @@ impl Sandbox {
         Ok(Self { docker })
     }
 
+    /// A sandbox with no Docker behind it, for tests that never start a
+    /// container, so they also run where there is no Docker, such as the
+    /// factory's own verify stage. Nothing is contacted until a call, and
+    /// every call fails.
+    pub fn unreachable() -> Result<Self> {
+        let docker =
+            Docker::connect_with_http("http://127.0.0.1:9", 5, bollard::API_DEFAULT_VERSION)
+                .context("making a Docker client with nothing behind it")?;
+        Ok(Self { docker })
+    }
+
     pub async fn ping(&self) -> Result<()> {
         self.docker
             .ping()
@@ -561,6 +572,12 @@ mod tests {
             limits: Limits::default(),
             timeout: Duration::from_secs(60),
         }
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_sandbox_is_made_without_docker_and_fails_calls() {
+        let sandbox = Sandbox::unreachable().unwrap();
+        assert!(sandbox.ping().await.is_err());
     }
 
     #[tokio::test]

@@ -317,10 +317,17 @@ impl World {
             claude_token: TOKEN.to_owned().into(),
         };
         let github = fake.github();
+        // Without the Docker tests, no stage runs, so the factory needs no
+        // Docker: these tests also pass where there is none.
+        let sandbox = if super::docker_requested() {
+            dsf::sandbox::Sandbox::connect().unwrap()
+        } else {
+            dsf::sandbox::Sandbox::unreachable().unwrap()
+        };
         let engine = Engine::new(
             engine_config,
             Store::open(&self.state.join("dsf.sqlite")).unwrap(),
-            dsf::sandbox::Sandbox::connect().unwrap(),
+            sandbox,
             dsf::hostgit::Git::locate().unwrap(),
             Box::new(|line| eprintln!("{line}")),
         )

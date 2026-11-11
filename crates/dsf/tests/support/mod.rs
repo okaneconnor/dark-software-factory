@@ -13,9 +13,14 @@ pub mod github;
 pub const FAKE_IMAGE: &str = "dsf-fake-agent:test";
 pub const TOKEN: &str = "sk-ant-oat01-fake-token-for-tests-only-0123456789";
 
+/// Whether this run asked for the Docker-backed tests.
+pub fn docker_requested() -> bool {
+    std::env::var_os("DSF_DOCKER_TESTS").is_some_and(|v| v == "1")
+}
+
 pub fn enabled() -> bool {
     static BUILT: OnceLock<bool> = OnceLock::new();
-    if std::env::var_os("DSF_DOCKER_TESTS").is_none_or(|v| v != "1") {
+    if !docker_requested() {
         eprintln!("skipped: set DSF_DOCKER_TESTS=1 to run Docker tests");
         return false;
     }
