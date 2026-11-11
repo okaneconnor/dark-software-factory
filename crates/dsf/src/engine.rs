@@ -12,7 +12,7 @@
 //! git credentials and opens the pull request through [`Forge`]; claiming
 //! issues and keeping their labels current is `factory`'s job.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -241,6 +241,9 @@ struct Run {
     plan: Option<String>,
     verify_output: Option<String>,
     review: Option<String>,
+    /// Each review stage's findings from its previous visit, when that
+    /// visit requested changes. Keyed by stage name.
+    previous_reviews: BTreeMap<String, String>,
     approve_gate: bool,
     /// The repository's instructions for agents, read from the base commit
     /// when the run started.
@@ -680,7 +683,11 @@ impl Engine {
         let prompts = Prompts::from_snapshot(&dir.factory_snapshot())?;
         // Runs from before instructions were saved simply have none.
         let instructions = std::fs::read_to_string(dir.instructions()).unwrap_or_default();
-        let (verify_output, review) = self.handoff(stored.id, &dir, &workflow)?;
+        let Handoff {
+            verify_output,
+            review,
+            previous_reviews,
+        } = self.handoff(stored.id, &dir, &workflow)?;
         let (protected, protected_list) = self.protected();
         Ok(Run {
             id: stored.id,
@@ -696,6 +703,7 @@ impl Engine {
             plan: stored.plan.clone(),
             verify_output,
             review,
+            previous_reviews,
             approve_gate: options.approve,
             instructions,
         })
@@ -787,6 +795,7 @@ impl Engine {
             plan: None,
             verify_output: None,
             review: None,
+            previous_reviews: BTreeMap::new(),
             approve_gate: false,
             instructions,
         })))
@@ -1136,7 +1145,9 @@ impl Engine {
         prompt_name: &str,
         schema: Option<Schema>,
     ) -> Result<StageResult> {
-        let prompt = self.render_prompt(run, visit, prompt_name, schema).await?;
+        let prompt = self
+            .render_prompt(run, stage, visit, prompt_name, schema)
+            .await?;
         std::fs::write(attempt_dir.join("prompt.md"), &prompt)?;
         let context = match self.stage_context(run, attempt_dir)? {
             Ok(context) => context,
@@ -1183,7 +1194,7 @@ impl Engine {
                 {
                     return Ok(StageResult::Block(reason));
                 }
-                self.completed(run, schema, completion)
+                self.completed(run, stage, schema, completion)
             }
             AgentOutcome::Limited { resets_at, detail } => {
                 run.repo.reset_to(&run.checkpoint).await?;
@@ -1268,10 +1279,12 @@ impl Engine {
     }
 
     /// The stage's prompt, with the context gathered so far: the plan, the
-    /// change, and the last verify output and review.
+    /// change, the last verify output and review, and the stage's own
+    /// findings from its previous visit.
     async fn render_prompt(
         &self,
         run: &Run,
+        stage: &StageId,
         visit: u32,
         name: &str,
         schema: Option<Schema>,
@@ -1305,6 +1318,7 @@ impl Engine {
             diff,
             verify_output: run.verify_output.clone(),
             review: run.review.as_deref(),
+            previous_review: run.previous_reviews.get(stage.as_str()).map(String::as_str),
         };
         run.prompts.render(name, &context)
     }
@@ -1315,6 +1329,7 @@ impl Engine {
     fn completed(
         &self,
         run: &mut Run,
+        stage: &StageId,
         schema: Option<Schema>,
         completion: agent::Completion,
     ) -> Result<StageResult> {
@@ -1339,6 +1354,19 @@ impl Engine {
                     run.review = (label == "changes_requested").then(|| review_text(output));
                 }
                 None => {}
+            }
+        }
+        if schema == Some(Schema::Review) {
+            // Without structured output nothing was stored, so a resume would
+            // find no findings either.
+            match (&run.review, &completion.structured) {
+                (Some(findings), Some(_)) => {
+                    run.previous_reviews
+                        .insert(stage.as_str().to_owned(), findings.clone());
+                }
+                _ => {
+                    run.previous_reviews.remove(stage.as_str());
+                }
             }
         }
         Ok(StageResult::Outcome {
@@ -1652,12 +1680,7 @@ impl Engine {
 
     /// The verify output and review feedback a resumed fix stage needs,
     /// from the run's most recent attempts.
-    fn handoff(
-        &self,
-        run_id: i64,
-        dir: &RunDir,
-        workflow: &Workflow,
-    ) -> Result<(Option<String>, Option<String>)> {
+    fn handoff(&self, run_id: i64, dir: &RunDir, workflow: &Workflow) -> Result<Handoff> {
         let attempts = self.db()?.attempts(run_id)?;
         let kind_of = |stage: &str| {
             StageId::new(stage)
@@ -1691,7 +1714,11 @@ impl Engine {
             .and_then(|a| a.structured_output.as_deref())
             .and_then(|json| serde_json::from_str::<Value>(json).ok())
             .map(|output| review_text(&output));
-        Ok((verify_output, review))
+        Ok(Handoff {
+            verify_output,
+            review,
+            previous_reviews: previous_reviews(&attempts, workflow),
+        })
     }
 
     fn run_label(&self, run_id: i64) -> String {
@@ -1761,6 +1788,46 @@ fn plan_text(output: &Value) -> String {
         }
     }
     text
+}
+
+/// What a resumed run's prompts carry over from earlier attempts.
+struct Handoff {
+    verify_output: Option<String>,
+    review: Option<String>,
+    previous_reviews: BTreeMap<String, String>,
+}
+
+/// Each review stage's findings from its latest finished attempt, when that
+/// attempt requested changes. Attempts still in flight have no outcome and
+/// are skipped, so they never hide the real previous visit.
+fn previous_reviews(attempts: &[Attempt], workflow: &Workflow) -> BTreeMap<String, String> {
+    let mut found = BTreeMap::new();
+    for attempt in attempts.iter().filter(|a| a.outcome.is_some()) {
+        let is_review = StageId::new(&attempt.stage)
+            .and_then(|id| workflow.stage(&id))
+            .is_some_and(|s| {
+                matches!(
+                    s.kind,
+                    StageKind::Agent {
+                        schema: Some(Schema::Review),
+                        ..
+                    }
+                )
+            });
+        if !is_review {
+            continue;
+        }
+        let findings = (attempt.outcome.as_deref() == Some("changes_requested"))
+            .then_some(attempt.structured_output.as_deref())
+            .flatten()
+            .and_then(|json| serde_json::from_str::<Value>(json).ok())
+            .map(|output| review_text(&output));
+        match findings {
+            Some(text) => found.insert(attempt.stage.clone(), text),
+            None => found.remove(&attempt.stage),
+        };
+    }
+    found
 }
 
 fn review_text(output: &Value) -> String {
@@ -1954,6 +2021,85 @@ mod tests {
             after_sha: None,
             structured_output: structured.map(|output| output.to_string()),
         }
+    }
+
+    fn review_attempt(id: i64, stage: &str, outcome: &str, summary: &str) -> Attempt {
+        let output = serde_json::json!({
+            "outcome": outcome,
+            "summary": summary,
+            "issues": ["Fix it"],
+        });
+        attempt(id, stage, outcome, Some(output))
+    }
+
+    fn two_review_workflow() -> Workflow {
+        let toml = include_str!("../../../defaults/workflow.toml").replace(
+            "approve = \"@publish\", changes_requested = \"fix\" }\nexhausted = \"@publish\"",
+            "approve = \"review_b\", changes_requested = \"fix\" }\nexhausted = \"@publish\"",
+        ) + "\n[stages.review_b]\nkind = \"agent\"\nmode = \"read\"\nprompt = \"review.md.j2\"\nschema = \"review\"\nmax_visits = 2\non = { approve = \"@publish\", changes_requested = \"fix\" }\nexhausted = \"@publish\"\n";
+        Workflow::parse(&toml).unwrap()
+    }
+
+    #[test]
+    fn each_review_stage_sees_only_its_own_findings() {
+        let workflow = two_review_workflow();
+        let attempts = [
+            review_attempt(1, "review", "changes_requested", "From the first."),
+            review_attempt(2, "review_b", "changes_requested", "From the second."),
+        ];
+        let found = previous_reviews(&attempts, &workflow);
+        assert_eq!(found["review"], "From the first.\n- Fix it");
+        assert_eq!(found["review_b"], "From the second.\n- Fix it");
+
+        let attempts = [
+            review_attempt(1, "review", "changes_requested", "From the first."),
+            review_attempt(2, "review_b", "approve", "Fine."),
+        ];
+        let found = previous_reviews(&attempts, &workflow);
+        assert_eq!(found.len(), 1);
+        assert!(found.contains_key("review"));
+    }
+
+    #[test]
+    fn a_second_visit_gets_the_first_visits_findings() {
+        let workflow = Workflow::builtin().unwrap();
+        let attempts = [review_attempt(1, "review", "changes_requested", "Close.")];
+        assert_eq!(
+            previous_reviews(&attempts, &workflow)
+                .get("review")
+                .map(String::as_str),
+            Some("Close.\n- Fix it")
+        );
+    }
+
+    #[test]
+    fn an_approval_leaves_no_previous_review() {
+        let workflow = Workflow::builtin().unwrap();
+        let attempts = [
+            review_attempt(1, "review", "changes_requested", "Close."),
+            review_attempt(2, "review", "approve", "Good."),
+        ];
+        assert!(previous_reviews(&attempts, &workflow).is_empty());
+    }
+
+    #[test]
+    fn an_attempt_still_in_flight_does_not_hide_the_previous_visit() {
+        let workflow = Workflow::builtin().unwrap();
+        let mut running = attempt(2, "review", "", None);
+        running.status = "running".to_owned();
+        running.outcome = None;
+        let attempts = [
+            review_attempt(1, "review", "changes_requested", "Close."),
+            running,
+        ];
+        assert!(previous_reviews(&attempts, &workflow).contains_key("review"));
+    }
+
+    #[test]
+    fn other_stages_attempts_are_not_review_findings() {
+        let workflow = Workflow::builtin().unwrap();
+        let attempts = [attempt(1, "fix", "changes_requested", None)];
+        assert!(previous_reviews(&attempts, &workflow).is_empty());
     }
 
     #[test]

@@ -26,7 +26,15 @@ The change:
 <diff>
 {{ diff }}
 </diff>
+{% if previous_review %}
+You reviewed an earlier version of this change and asked for changes. Your findings were:
 
+<previous_review>
+{{ previous_review }}
+</previous_review>
+
+For each of those findings, say in your summary whether the change now addresses it. Raise a new finding only for code that changed since then, or for a problem that must be fixed.
+{% endif %}
 Review it the way a careful senior engineer would, in four passes:
 
 1. **The issue.** Does the change do what the issue asks, and nothing it doesn't?
