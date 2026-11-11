@@ -1,0 +1,6 @@
+{
+  "name": "practices",
+  "version": "0.1.0",
+  "description": "Language-neutral working practices: test first, find the root cause before fixing, and show evidence before claiming success.",
+  "license": "MIT"
+}
